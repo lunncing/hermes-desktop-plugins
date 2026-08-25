@@ -1,0 +1,12 @@
+{
+  "name": "minicpm-native-voice",
+  "label": "MiniCPM Native Voice",
+  "description": "Backend bridge for the native Hermes Desktop English Coach page.",
+  "icon": "Mic",
+  "version": "1.0.0",
+  "tab": {
+    "hidden": true
+  },
+  "slots": [],
+  "api": "plugin_api.py"
+}

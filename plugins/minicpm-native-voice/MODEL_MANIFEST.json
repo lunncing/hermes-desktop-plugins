@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "purpose": "Exact required GGUF set used for the MiniCPM Native Voice audio-only Windows/Vulkan acceptance candidate",
+  "reproduction_profile": {
+    "media_type": 1,
+    "modality": "audio-only",
+    "vision_required": false
+  },
+  "source_repository": "https://huggingface.co/openbmb/MiniCPM-o-4_5-gguf",
+  "source_revision": null,
+  "source_revision_status": "unavailable",
+  "source_revision_note": "The recorded local download did not retain a Hugging Face revision. Hashes verify files already obtained, but revision-qualified remote retrieval remains unresolved.",
+  "companion_server_repository": "https://github.com/lunncing/llama.cpp-omni",
+  "companion_server_commit": "46c09e5ad93823fcc6de46e48976761247a12d2f",
+  "files": [
+    {
+      "path": "audio/MiniCPM-o-4_5-audio-F16.gguf",
+      "bytes": 660167904,
+      "sha256": "d5b188ac7feaf98e17175c3f9bd14bf269301bfd187439fdaa3e3a494fc32ef7"
+    },
+    {
+      "path": "MiniCPM-o-4_5-Q4_K_M.gguf",
+      "bytes": 5026714400,
+      "sha256": "1237a97ee081b8abebc47aa7dad565701e8f5f904cdc92f6723ac4281bbc0932"
+    },
+    {
+      "path": "token2wav-gguf/encoder.gguf",
+      "bytes": 151339008,
+      "sha256": "7f8d265da594eaf5e1de2db8f5f1867dbcb0bb75ef5878fadf2952347116f4d0"
+    },
+    {
+      "path": "token2wav-gguf/flow_extra.gguf",
+      "bytes": 13663328,
+      "sha256": "c67611aa7d02500fe395a7798bf0bfdfb55c74d37ba93934ca74d82b4e63f78d"
+    },
+    {
+      "path": "token2wav-gguf/flow_matching.gguf",
+      "bytes": 458250240,
+      "sha256": "eda6069f3edeb5dd3a87fbf2aedb2ddd1b46f3273926c4fcf09b24476a39cab8"
+    },
+    {
+      "path": "token2wav-gguf/hifigan2.gguf",
+      "bytes": 83242816,
+      "sha256": "1b8b3bf5d8d3066aeee4324fdcdd41aefce170d0ee907645858de408d82835c2"
+    },
+    {
+      "path": "token2wav-gguf/prompt_cache.gguf",
+      "bytes": 211613152,
+      "sha256": "81fe6f541ebe0b67db06a1e395df928da47991dc9637c2cf47d6c59d5b979f2c"
+    },
+    {
+      "path": "tts/MiniCPM-o-4_5-projector-F16.gguf",
+      "bytes": 14948640,
+      "sha256": "4b1b5b377358a5e594a304ff6ea5d52df606a9ba7d886c4299d232f0c67dd1fd"
+    },
+    {
+      "path": "tts/MiniCPM-o-4_5-tts-F16.gguf",
+      "bytes": 1157244416,
+      "sha256": "c7be3748a863dd6966ae7eed42600b7f41ca67affb03729ff245247f0e5ea088"
+    }
+  ],
+  "optional_files": [
+    {
+      "path": "vision/MiniCPM-o-4_5-vision-F16.gguf",
+      "required_for_media_type_1": false,
+      "verification": "not part of the recorded acceptance candidate"
+    }
+  ]
+}

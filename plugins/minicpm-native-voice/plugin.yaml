@@ -1,0 +1,12 @@
+manifest_version: 2
+api_version: 1
+name: minicpm-native-voice
+version: 1.0.0
+description: Native turn-based audio bridge from Hermes Desktop to a loopback MiniCPM-o server.
+author: Hermes plugin contributors
+kind: standalone
+license: MIT
+tags:
+  - audio
+  - desktop
+  - local-model
