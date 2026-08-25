@@ -1,4 +1,9 @@
 node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+plugins/minicpm-native-voice/server.local.json
 *.log
 .DS_Store
 Thumbs.db

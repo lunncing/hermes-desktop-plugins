@@ -1,0 +1,63 @@
+name: MiniCPM Native Voice
+
+on:
+  push:
+    paths:
+      - "plugins/minicpm-native-voice/**"
+      - ".github/workflows/minicpm-native-voice.yml"
+  pull_request:
+    paths:
+      - "plugins/minicpm-native-voice/**"
+      - ".github/workflows/minicpm-native-voice.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plugin-tests:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+        node:
+          - "20.x"
+          - "22.x"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install explicit Python test dependencies
+        run: >-
+          python -m pip install
+          "fastapi>=0.115,<1"
+          "httpx>=0.27,<1"
+          "pydantic>=2.9,<3"
+          "python-multipart>=0.0.9,<1"
+          "websockets>=13,<16"
+          "pytest>=8,<10"
+          "pytest-asyncio>=0.24,<2"
+
+      - name: Run full Python plugin tests
+        run: python -m pytest plugins/minicpm-native-voice/tests -q
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Check Desktop plugin syntax
+        run: node --check plugins/minicpm-native-voice/desktop/plugin.js
+
+      - name: Run full Desktop plugin tests
+        run: node --test plugins/minicpm-native-voice/tests/plugin.test.cjs

@@ -11,6 +11,7 @@ A small collection of user-maintained plugins for the native [Hermes Agent](http
 | [`hide-version-pill`](plugins/hide-version-pill/) | Hides the locked version/update pill from the desktop status bar. |
 | [`hermes-trace-viewer`](plugins/hermes-trace-viewer/) | Read-only visual session trace: Input/Model/Tools timeline, turn-grouped nodes, filters, details, bounded data, and a future backend adapter seam. |
 | [`reveal-file-link`](plugins/reveal-file-link/) | Renders a safe transcript link that reveals an absolute file path in Finder or Explorer without opening it. |
+| [`minicpm-native-voice`](plugins/minicpm-native-voice/) | Windows-only, Vulkan-targeted native audio page and loopback MiniCPM-o bridge with incremental playback. |
 
 ## Installation
 
@@ -26,13 +27,18 @@ For example:
 $HERMES_HOME/desktop-plugins/token-tracker/plugin.js
 ```
 
-Hermes watches the directory and normally reloads disk plugins automatically. If necessary, open the command palette and run **Reload desktop plugins**. Plugins can be enabled or disabled under **Settings → Plugins**.
+Hermes watches the directory and normally reloads disk plugins automatically. If necessary, open the command palette and run **Reload desktop plugins**. Plugins can be enabled or disabled under **Settings -> Plugins**.
+
+`minicpm-native-voice` is a unified Desktop/backend package and uses the native
+plugin installer instead. Follow its [clean installation guide](plugins/minicpm-native-voice/README.md#clean-installation); do not copy only its Desktop entry file.
 
 ## Compatibility
 
 These plugins use the public `@hermes/plugin-sdk`, but `turn-start-navigator` and `hide-version-pill` also inspect desktop DOM hooks. A future Hermes UI update may require selector maintenance even though the plugin files themselves survive normal Hermes updates.
 
 ## Tests
+
+The `minicpm-native-voice` commands and their CI run on Windows only.
 
 ```bash
 node --check plugins/token-tracker/plugin.js
@@ -43,10 +49,13 @@ node --check plugins/hermes-trace-viewer/plugin.js
 node --test plugins/hermes-trace-viewer/plugin.test.cjs
 node --check plugins/reveal-file-link/plugin.js
 node --test plugins/reveal-file-link/plugin.test.cjs
+python -m pytest plugins/minicpm-native-voice/tests -q
+node --check plugins/minicpm-native-voice/desktop/plugin.js
+node --test plugins/minicpm-native-voice/tests/plugin.test.cjs
 ```
 
 Historical v2/v3 snapshots for the navigator are classified under [`archive/`](archive/) rather than left as `.bak` files in the active plugin directory.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
