@@ -90,11 +90,12 @@ def test_server_config_validates_file_directory_and_basename_contract(plugin_api
     with pytest.raises(plugin_api.ServerConfigurationError, match="gguf"):
         plugin_api.load_server_config(path)
 
-    wrong_executable = tmp_path / "bin" / "other-server.exe"
-    wrong_executable.write_bytes(b"wrong name")
-    path, _ = write_config(tmp_path, executable=str(wrong_executable))
-    with pytest.raises(plugin_api.ServerConfigurationError, match="llama-omni-server.exe"):
-        plugin_api.load_server_config(path)
+    if os.name == "nt":
+        wrong_executable = tmp_path / "bin" / "other-server.exe"
+        wrong_executable.write_bytes(b"wrong name")
+        path, _ = write_config(tmp_path, executable=str(wrong_executable))
+        with pytest.raises(plugin_api.ServerConfigurationError, match="llama-omni-server.exe"):
+            plugin_api.load_server_config(path)
 
 
 def test_server_config_wraps_output_creation_failures_as_controlled_errors(plugin_api, tmp_path):

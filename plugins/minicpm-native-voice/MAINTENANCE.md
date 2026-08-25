@@ -5,10 +5,15 @@ Server upgrades. Preserve the native-audio turn contract, exact user-owned
 prompt behavior, loopback boundary, process ownership, and resource ceilings
 unless a separately reviewed product change explicitly replaces them.
 
+**Supported scope:** This package is a **Windows-only, Vulkan-targeted
+deployment** for packaged Hermes Desktop, microphone capture, and device-split
+GPU acceptance. Automated checks and packaged acceptance are exercised on
+Windows.
+
 ## Reproduce the automated checks
 
-From a clean clone at the repository root, create a disposable environment.
-Windows PowerShell:
+From a clean clone at the repository root on Windows, create a disposable
+environment. Windows PowerShell:
 
 ```powershell
 python -m venv .venv
@@ -21,22 +26,13 @@ hermes plugins doctor --ci plugins/minicpm-native-voice
 git diff --check
 ```
 
-POSIX shell:
-
-```bash
-python3.12 -m venv .venv
-./.venv/bin/python -m pip install --upgrade pip
-./.venv/bin/python -m pip install 'fastapi>=0.115,<1' 'httpx>=0.27,<1' 'pydantic>=2.9,<3' 'python-multipart>=0.0.9,<1' 'websockets>=13,<16' 'pytest>=8,<10' 'pytest-asyncio>=0.24,<2'
-./.venv/bin/python -m pytest plugins/minicpm-native-voice/tests -q
-node --check plugins/minicpm-native-voice/desktop/plugin.js
-node --test plugins/minicpm-native-voice/tests/plugin.test.cjs
-hermes plugins doctor --ci plugins/minicpm-native-voice
-git diff --check
-```
-
 Plugin Doctor is required on a Hermes development/release machine. The GitHub
 workflow does not install Hermes and therefore runs the Python and Node suite
 only. Neither path requires model weights or a running Server.
+
+The tests may not be portable to non-Windows hosts because the managed-Server
+executable-name contract requires a Windows `.exe` basename. No cross-platform
+port is planned.
 
 Before publishing, inspect `git status --short` and the complete diff. Scan all
 changed publication files for local paths, credentials, prompt contents,
@@ -44,6 +40,10 @@ weights, logs, audio, and review artifacts. The only committed local Server
 file must be the placeholder-only `server.local.example.json`.
 
 ## Packaged Desktop acceptance matrix
+
+The clean-install and acceptance procedure covers only the **Windows-only,
+Vulkan-targeted deployment**. Run packaged Desktop, microphone, and
+device-split checks on Windows.
 
 Automated checks cannot validate Electron permissions, live devices, Vulkan,
 or audible output. Run this matrix on the exact packaged Desktop build,

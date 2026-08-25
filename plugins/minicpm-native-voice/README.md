@@ -35,6 +35,10 @@ the bridge can contact is `127.0.0.1`.
 
 ## Compatibility and prerequisites
 
+**Supported deployment:** This package is a **Windows-only, Vulkan-targeted
+deployment** for packaged Hermes Desktop, microphone capture, and device-split
+GPU acceptance. Its automated checks are exercised on Windows.
+
 The publication checks cover the following compatibility bands; they are test
 targets, not promises about every future release in each band:
 
@@ -66,14 +70,15 @@ and `pytest-asyncio`. The Desktop production imports (`@hermes/plugin-sdk`,
 `react`, and `react/jsx-runtime`) are supplied by Hermes Desktop; do not bundle
 a second React or SDK copy.
 
-Linux and macOS can run the Python and Node checks. The bridge and Desktop code
-use portable Python and Web APIs, and the non-Windows launcher does not require
-the `.exe` basename. However, V1 packaged-Desktop deployment and the described
-GPU split were accepted for Windows/Vulkan. Treat other operating systems,
-GPU backends, and Server build recipes as ports requiring their own acceptance
-run. SYCL is not a supported deployment path for this integration.
+The tests may not be portable to non-Windows hosts because the managed-Server
+executable-name contract requires a Windows `.exe` basename. No cross-platform
+port is planned. SYCL is not a supported deployment path for this integration.
 
 ## Clean installation
+
+This clean-install procedure is for the **Windows-only, Vulkan-targeted
+deployment**: packaged Desktop, microphone, and device-split acceptance are
+performed on Windows, as are the automated checks.
 
 ### 1. Install the unified Hermes package
 
