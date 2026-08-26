@@ -6,14 +6,19 @@ Hermes mounts ``router`` below ``/api/plugins/minicpm-native-voice/``.
 from __future__ import annotations
 
 import asyncio
+import array
 import base64
 import contextlib
 import json
+import math
 import os
 import socket
 import subprocess
+import sys
+import tempfile
 import time
 import uuid
+import wave
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -56,6 +61,7 @@ DEFAULT_UPSTREAM_PORT = 9060
 UPSTREAM_WS_PATH = "/backend"
 ALLOWED_HTTP_PATHS = frozenset({"/health"})
 MAX_AUDIO_BYTES = 5_242_880
+INPUT_AUDIO_SAMPLE_RATE = 16_000
 MAX_SYSTEM_PROMPT_BYTES = 65_536
 NATIVE_AUDIO_CONTENT_TYPE = "application/octet-stream"
 EVENT_QUEUE_MAX = 64
@@ -718,6 +724,95 @@ def _utf8_prefix(value: str, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
+def _transcription_result(result: Any, default_provider: str) -> dict[str, str] | None:
+    if not isinstance(result, dict) or not result.get("success"):
+        return None
+    transcript = result.get("transcript")
+    if not isinstance(transcript, str) or not transcript.strip():
+        return None
+    provider = result.get("provider", default_provider)
+    if not isinstance(provider, str) or not provider:
+        provider = default_provider
+    return {
+        "text": _utf8_prefix(transcript.strip(), TRANSCRIPT_MAX_BYTES),
+        "provider": _utf8_prefix(provider, 128),
+    }
+
+
+def transcribe_display_audio(
+    raw: bytes,
+    *,
+    configured_transcriber: Callable[[str], Any] | None = None,
+    local_transcriber: Callable[[str], Any] | None = None,
+    temp_directory: Path | None = None,
+) -> dict[str, str] | None:
+    """Transcribe bounded native input through Hermes without changing model input."""
+    validate_audio_bytes(raw)
+    samples = array.array("f")
+    samples.frombytes(raw)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    pcm16 = array.array("h")
+    for sample in samples:
+        if not math.isfinite(sample):
+            value = 0
+        else:
+            value = max(-32_768, min(32_767, round(sample * 32_768)))
+        pcm16.append(value)
+    if sys.byteorder != "little":
+        pcm16.byteswap()
+
+    temporary = tempfile.NamedTemporaryFile(
+        mode="w+b",
+        suffix=".wav",
+        prefix="minicpm-display-stt-",
+        dir=temp_directory,
+        delete=False,
+    )
+    temporary_path = Path(temporary.name)
+    temporary.close()
+    try:
+        with wave.open(str(temporary_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(INPUT_AUDIO_SAMPLE_RATE)
+            wav_file.writeframes(pcm16.tobytes())
+
+        if configured_transcriber is None:
+            try:
+                from tools.voice_mode import transcribe_recording
+
+                configured_transcriber = transcribe_recording
+            except Exception:
+                configured_transcriber = None
+        if configured_transcriber is not None:
+            try:
+                configured_result = configured_transcriber(str(temporary_path))
+            except Exception:
+                configured_result = None
+            if isinstance(configured_result, dict) and configured_result.get("success"):
+                return _transcription_result(configured_result, "configured")
+
+        if local_transcriber is None:
+            try:
+                from tools.transcription_tools import transcribe_audio_local_fallback
+
+                local_transcriber = transcribe_audio_local_fallback
+            except Exception:
+                local_transcriber = None
+        if local_transcriber is not None:
+            try:
+                return _transcription_result(
+                    local_transcriber(str(temporary_path)), "local"
+                )
+            except Exception:
+                return None
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            temporary_path.unlink()
+
+
 def decode_audio_delta(encoded: Any) -> bytes:
     if not isinstance(encoded, str) or not encoded:
         raise AudioDeltaValidationError("audio delta must be non-empty Base64")
@@ -835,6 +930,9 @@ async def _request_session_close(session_id: str, port: int) -> None:
         await client.post(build_upstream_close_url(port, session_id))
 
 
+_DEFAULT_TRANSCRIPTION_RUNNER = object()
+
+
 class VoiceBridge:
     """Single-session, single-turn bridge with explicit resource ownership."""
 
@@ -846,12 +944,20 @@ class VoiceBridge:
         port: int = DEFAULT_UPSTREAM_PORT,
         event_queue_max: int = EVENT_QUEUE_MAX,
         event_queue_max_bytes: int = EVENT_QUEUE_MAX_BYTES,
+        transcription_runner: Callable[[bytes], dict[str, str] | None]
+        | None
+        | object = _DEFAULT_TRANSCRIPTION_RUNNER,
     ):
         self.port = validate_upstream_port(port)
         self.active_port = self.port
         self.connector = connector or _connect_upstream
         self.close_session_request = close_session_request or _request_session_close
         self.events = EventBroker(event_queue_max, event_queue_max_bytes)
+        self.transcription_runner = (
+            transcribe_display_audio
+            if transcription_runner is _DEFAULT_TRANSCRIPTION_RUNNER
+            else transcription_runner
+        )
         self.state = "shell_ready"
         self.session_id: str | None = None
         self.turn_id: str | None = None
@@ -868,6 +974,7 @@ class VoiceBridge:
         self._stopping = False
         self._generation = 0
         self._seq = 0
+        self._transcription_tasks: set[asyncio.Task] = set()
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -1042,6 +1149,7 @@ class VoiceBridge:
 
     async def submit_turn(self, raw: bytes) -> dict[str, Any]:
         payload = build_turn_payload(raw)
+        duration_seconds = round(len(raw) / 4 / INPUT_AUDIO_SAMPLE_RATE, 3)
         async with self._lock:
             if self.session_id is None or self.ws is None:
                 raise BridgeConflict("no active voice session")
@@ -1057,6 +1165,13 @@ class VoiceBridge:
             session_id = self.session_id
             turn_id = self.turn_id
         assert session_id is not None
+        await self._emit(
+            "turn.started",
+            generation=generation,
+            session_id=session_id,
+            turn_id=turn_id,
+            duration_seconds=duration_seconds,
+        )
         await self._emit_state(generation=generation, session_id=session_id)
         try:
             async with self._lock:
@@ -1072,6 +1187,12 @@ class VoiceBridge:
                     or self.turn_id != turn_id
                 ):
                     raise BridgeConflict("voice turn was cancelled")
+            self._schedule_transcription(
+                raw,
+                generation=generation,
+                session_id=session_id,
+                turn_id=turn_id,
+            )
         except Exception as exc:
             await self._fail(
                 exc,
@@ -1083,6 +1204,69 @@ class VoiceBridge:
                 raise
             raise BridgeUpstreamError(str(exc)) from exc
         return self.snapshot()
+
+    def _schedule_transcription(
+        self,
+        raw: bytes,
+        *,
+        generation: int,
+        session_id: str,
+        turn_id: str,
+    ) -> None:
+        if self.transcription_runner is None:
+            return
+        task = asyncio.create_task(
+            self._run_transcription(
+                raw,
+                generation=generation,
+                session_id=session_id,
+                turn_id=turn_id,
+            ),
+            name=f"minicpm-display-stt-{generation}-{turn_id}",
+        )
+        self._transcription_tasks.add(task)
+        task.add_done_callback(self._transcription_tasks.discard)
+
+    async def _run_transcription(
+        self,
+        raw: bytes,
+        *,
+        generation: int,
+        session_id: str,
+        turn_id: str,
+    ) -> None:
+        try:
+            result = await asyncio.to_thread(self.transcription_runner, raw)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+        if not isinstance(result, dict):
+            return
+        text = result.get("text")
+        provider = result.get("provider")
+        if not isinstance(text, str):
+            return
+        text = _utf8_prefix(text.strip(), TRANSCRIPT_MAX_BYTES)
+        if not text:
+            return
+        if not isinstance(provider, str) or not provider:
+            provider = "unknown"
+        async with self._lock:
+            if (
+                self._generation != generation
+                or self.session_id != session_id
+                or self._stopping
+            ):
+                return
+            await self._emit(
+                "user.transcript",
+                generation=generation,
+                session_id=session_id,
+                turn_id=turn_id,
+                text=text,
+                provider=_utf8_prefix(provider, 128),
+            )
 
     async def _read_upstream(self, ws: Any, generation: int, session_id: str) -> None:
         try:
@@ -1139,6 +1323,9 @@ class VoiceBridge:
             async with self._lock:
                 if not self._owns_session_locked(generation, session_id, active_ws):
                     return
+                turn_id = self.turn_id
+                if turn_id is None:
+                    return
                 remaining = max(0, TRANSCRIPT_MAX_BYTES - self.current_text_bytes)
                 forwarded = _utf8_prefix(text, min(remaining, TRANSCRIPT_DELTA_MAX_BYTES))
                 self.current_text += forwarded
@@ -1148,6 +1335,7 @@ class VoiceBridge:
                     "text.delta",
                     generation=generation,
                     session_id=session_id,
+                    turn_id=turn_id,
                     text=forwarded,
                     metrics=metrics,
                 )
@@ -1165,6 +1353,9 @@ class VoiceBridge:
                 return
             async with self._lock:
                 if not self._owns_session_locked(generation, session_id, active_ws):
+                    return
+                turn_id = self.turn_id
+                if turn_id is None:
                     return
                 if self.generated_audio_bytes + len(raw_audio) > MAX_GENERATED_AUDIO_BYTES:
                     over_budget = True
@@ -1193,6 +1384,7 @@ class VoiceBridge:
                 "audio.delta",
                 generation=generation,
                 session_id=session_id,
+                turn_id=turn_id,
                 audio=audio,
                 sample_rate=sample_rate,
                 metrics=metrics,
@@ -1204,6 +1396,9 @@ class VoiceBridge:
             async with self._lock:
                 if not self._owns_session_locked(generation, session_id, active_ws):
                     return
+                turn_id = self.turn_id
+                if turn_id is None:
+                    return
                 self.current_text = full_text
                 self.current_text_bytes = len(full_text.encode("utf-8"))
                 self.turn_id = None
@@ -1212,6 +1407,7 @@ class VoiceBridge:
                 "response.done",
                 generation=generation,
                 session_id=session_id,
+                turn_id=turn_id,
                 response_id=event.get("response_id"),
                 text=full_text,
                 metrics=metrics,
@@ -1246,6 +1442,8 @@ class VoiceBridge:
                 return
             ws = self.ws or self._connecting_ws
             reader = self.reader_task
+            transcription_tasks = list(self._transcription_tasks)
+            self._transcription_tasks.clear()
             session_to_close = (
                 session_id
                 if session_id is not None and self.session_id == session_id
@@ -1263,6 +1461,11 @@ class VoiceBridge:
         if reader is not None and reader is not current_task and not reader.done():
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
+        for task in transcription_tasks:
+            if task is not current_task and not task.done():
+                task.cancel()
+        if transcription_tasks:
+            await asyncio.gather(*transcription_tasks, return_exceptions=True)
         if session_to_close is not None:
             with contextlib.suppress(Exception):
                 await self.close_session_request(session_to_close, active_port)
@@ -1287,7 +1490,14 @@ class VoiceBridge:
                 cleanup_task = self._stop_task
             else:
                 had_resources = any(
-                    (self.session_id, self.ws, self._connecting_ws, self.reader_task, self._starting)
+                    (
+                        self.session_id,
+                        self.ws,
+                        self._connecting_ws,
+                        self.reader_task,
+                        self._starting,
+                        self._transcription_tasks,
+                    )
                 )
                 if not had_resources and self.state == "shell_ready":
                     return self.snapshot()
@@ -1299,6 +1509,8 @@ class VoiceBridge:
                 ws = self.ws or self._connecting_ws
                 reader = self.reader_task
                 starter = self._start_task
+                transcription_tasks = list(self._transcription_tasks)
+                self._transcription_tasks.clear()
                 self.session_id = None
                 self.turn_id = None
                 self.ws = None
@@ -1318,6 +1530,7 @@ class VoiceBridge:
                         ws=ws,
                         reader=reader,
                         starter=starter,
+                        transcription_tasks=transcription_tasks,
                         caller=current_task,
                         generation=stop_generation,
                     ),
@@ -1335,12 +1548,13 @@ class VoiceBridge:
         ws: Any,
         reader: asyncio.Task | None,
         starter: asyncio.Task | None,
+        transcription_tasks: list[asyncio.Task],
         caller: asyncio.Task | None,
         generation: int,
     ) -> None:
         tasks = [
             task
-            for task in (reader, starter)
+            for task in (reader, starter, *transcription_tasks)
             if task is not None and task is not caller and not task.done()
         ]
         for task in tasks:

@@ -2,12 +2,18 @@
 
 `minicpm-native-voice` is one unified Hermes plugin package: an **English
 Coach** page in Hermes Desktop plus an authenticated dashboard/backend bridge
-to a local `llama-omni-server`. V1 sends microphone samples to MiniCPM-o as
-native audio and plays native audio returned by Token2Wav and HiFiGAN.
+to a local `llama-omni-server`. V2 sends microphone samples to MiniCPM-o as
+native audio, shows a concurrent display-only transcript in persistent turn
+bubbles, and plays native audio returned by Token2Wav and HiFiGAN.
 
-This is **native audio, turn-based streaming V1**. It is not a speech-to-text
-(STT) cascade, and it is not strict full duplex. Experimental client-side
+This is **native audio, turn-based streaming V2**. STT is display-only: it never
+gates, alters, or replaces raw audio sent to MiniCPM-o. This is not an STT/text
+generation/TTS cascade and is not strict full duplex. Experimental client-side
 barge-in is available but is off by default.
+
+Display STT tries the user's already-configured Hermes transcription provider,
+then an already-installed local fallback. The plugin does not configure a cloud
+provider, install an STT package, or download a transcription model.
 
 For implementation ownership, protocol details, and symptom-to-source routing,
 see [ARCHITECTURE.md](ARCHITECTURE.md). For release checks, upgrades, recovery,
@@ -19,6 +25,7 @@ and rollback, see [MAINTENANCE.md](MAINTENANCE.md).
 microphone
   -> Hermes Desktop plugin (capture, VAD, 16 kHz mono Float32 PCM)
   -> authenticated Hermes plugin API (multipart HTTP)
+     -> concurrent Hermes STT -> display-only user bubble
   -> loopback bridge (127.0.0.1 only)
   -> llama-omni-server WebSocket (/backend)
   -> MiniCPM-o native-audio inference
@@ -42,7 +49,7 @@ GPU acceptance. Its automated checks are exercised on Windows.
 The publication checks cover the following compatibility bands; they are test
 targets, not promises about every future release in each band:
 
-- Windows 11 x64 is the V1 deployment target. A current Vulkan-capable GPU and
+- Windows 11 x64 is the V2 deployment target. A current Vulkan-capable GPU and
   vendor driver are required for the main model and Token2Wav path.
 - Hermes Agent/Desktop must support unified native plugin packages,
   `manifest_version: 2`, dashboard plugin APIs, and the Desktop plugin SDK
@@ -204,7 +211,7 @@ an empty Server-init system prompt, the configured output directory, and
 - Token2Wav runs on Vulkan (`token2wav_device: "gpu:0"`).
 - `OMNI_T2W_FUSED_QKV=0` is set only in the managed child because that path is
   required by this Vulkan integration.
-- HiFiGAN remains on CPU. Do not move it to the GPU when reproducing V1.
+- HiFiGAN remains on CPU. Do not move it to the GPU when reproducing V2.
 - Do not use a SYCL build or deployment for this published configuration.
 
 If you launch the companion Server yourself, reproduce the same device split
@@ -245,10 +252,16 @@ model-facing contract and must be treated as a product change.
 3. Wait for `ready` (managed) or `external` (self-managed).
 4. Enter an optional prompt. Empty is valid and means exactly empty.
 5. Select **Start** and grant microphone permission.
-6. Speak. V1 retains at most 500 ms of pre-roll, starts the 60-second utterance
+6. Speak. V2 retains at most 500 ms of pre-roll, starts the 60-second utterance
    allowance when speech begins, and submits after the configured 2,000-6,000
    ms silence window; select **I'm done** to submit sooner. Earlier initial
-   silence is discarded.
+   silence is discarded. The right-side bubble first shows the native-audio
+   duration, then updates in place if display transcription succeeds; prior
+   user-right/assistant-left turn pairs remain visible for this runtime. A
+   completed turn ignores later text/audio deltas and duplicate completion;
+   late display STT may still update its matching user bubble. History keeps at
+   most 100 turns and 1 MiB of combined user/assistant UTF-8 text, evicting the
+   oldest completed turns first without dropping the active pending turn.
 7. Use **Interrupt** to stop playback and create a fresh upstream session with
    the same exact prompt. Use **End** to release the voice session.
 8. **Stop Server** first ends voice resources and then stops only the process
@@ -265,7 +278,8 @@ model-facing contract and must be treated as a product change.
 | Microphone does not start | Check Windows microphone privacy settings, packaged Desktop permission, input device routing, and whether another application owns the device. End the session before retrying. |
 | Microphone meter moves but no turn is sent | Speak above the VAD threshold, wait through the selected silence window, or select **I'm done**. Initial silence beyond the 500 ms pre-roll is intentionally ignored; the 60-second allowance starts at speech onset. |
 | Prompt is rejected | Encode the exact value as UTF-8 and keep it at or below 65,536 bytes. The plugin never silently trims or truncates an over-limit prompt. |
-| No audio events arrive | Verify a local token-mode Desktop/backend connection, Server `/backend` compatibility, and that `/status` reaches `thinking`/`speaking`. OAuth-remote Desktop sockets are unsupported in V1; polling reports state but cannot carry incremental audio. |
+| No audio events arrive | Verify a local token-mode Desktop/backend connection, Server `/backend` compatibility, and that `/status` reaches `thinking`/`speaking`. OAuth-remote Desktop sockets are unsupported in V2; polling reports state but cannot carry incremental audio. |
+| User bubble stays at native-audio duration | Display STT is best-effort. Check the configured Hermes STT provider and credentials, then confirm an already-installed local fallback exists. Failure never blocks native MiniCPM input or voice playback. |
 | Audio is distorted, too fast, or too slow | Confirm input is mono 16 kHz little-endian Float32 PCM and output deltas are aligned little-endian Float32 with a correct positive `sample_rate`. Missing Server sample rate falls back to 24 kHz. Check the required Token2Wav/HiFiGAN layout and device split. |
 | Prompt is missing or changed | Inspect the `userOwnedModelPrompt` value through plugin behavior, not model logs. Confirm the field was not cleared and that no fork added defaults or trimming. The backend and wire payload must preserve whitespace exactly. |
 | Backend or Desktop appears stale after an update | End the voice session, Stop Server if it is managed, restart the dashboard/gateway to remount Python, use **Reload desktop plugins**, and reopen the route. If needed, fully exit and restart packaged Desktop. Do not diagnose stale bytecode by editing production behavior. |
@@ -287,24 +301,29 @@ model-facing contract and must be treated as a product change.
   never-disk privacy guarantee. Temporary-file remnants, indexing, backup, and
   endpoint-security behavior depend on the host operating system and its temp
   directory policy.
-- The plugin does not deliberately save microphone uploads to plugin storage or
-  logs. Generated bridge events are memory-bounded, while the companion Server
-  may write artifacts under the configured output directory; treat that
-  directory, the configured log, and the system temporary directory as
-  potentially containing sensitive voice data and secure/clean them according
-  to local policy.
+- Display STT writes each accepted turn to a bounded mono PCM16 WAV in the
+  operating-system temporary directory and deletes it after the configured/local
+  transcription attempt. The plugin does not retain audio or transcripts in
+  plugin storage or logs. Generated bridge events and session-local history are
+  memory-bounded, while the companion Server may write artifacts under the
+  configured output directory; treat that directory, the configured log, and
+  the system temporary directory as potentially containing sensitive voice data
+  and secure/clean them according to local policy.
 - No credentials, OAuth material, model weights, logs, generated audio, or
   prompt contents belong in source control or bug reports.
 
 ## Known limitations and non-goals
 
 - One voice session and one active turn are supported at a time.
-- V1 is native-audio turn-taking, not STT plus text generation plus TTS.
+- V2 is native-audio turn-taking with best-effort display STT, not STT plus text generation plus TTS.
+- Session-local history retains at most 100 turns, 65,536 UTF-8 bytes per user
+  or assistant field, and 1 MiB of combined field text. Oldest completed turns
+  are evicted first; the active pending turn is retained within its field caps.
 - Interrupt creates a fresh upstream session; it does not preserve generation
   state.
 - Automatic barge-in is experimental client-side behavior, not strict full
   duplex.
-- OAuth-remote Desktop sockets cannot stream incremental audio in V1.
+- OAuth-remote Desktop sockets cannot stream incremental audio in V2.
 - Managed process ownership is in-memory. After a backend crash/restart, a
   surviving Server is `external` and is never killed automatically.
 - Server model weights, Server builds, microphone permission, device routing,

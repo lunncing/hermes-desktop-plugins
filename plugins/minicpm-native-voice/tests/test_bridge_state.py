@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import builtins
 import json
+import struct
+import threading
+import wave
 
 import pytest
 import websockets
@@ -233,6 +236,241 @@ async def test_upstream_events_are_forwarded_in_order_with_audio_rate_fallback(p
     assert bridge.snapshot()["state"] == "listening"
     bridge.events.unsubscribe(queue)
     await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_turn_identity_starts_immediately_and_follows_every_response_event(plugin_api):
+    upstream = FakeUpstream()
+
+    async def connect(_url, **_kwargs):
+        return upstream
+
+    bridge = plugin_api.VoiceBridge(connector=connect)
+    await bridge.start_session("")
+    queue = bridge.events.subscribe()
+
+    snapshot = await bridge.submit_turn(b"\0\0\0\0" * 16_000)
+    started = await asyncio.wait_for(queue.get(), timeout=1)
+
+    assert started["type"] == "turn.started"
+    assert started["turn_id"] == snapshot["turn_id"]
+    assert started["session_id"] == "session-1"
+    assert started["generation"] == snapshot["generation"]
+    assert started["duration_seconds"] == 1.0
+
+    await upstream.push({"type": "response.output.delta", "kind": "text", "text": "Hi"})
+    await upstream.push(
+        {"type": "response.output.delta", "kind": "audio", "audio": "AAAAAA=="}
+    )
+    await upstream.push({"type": "response.done", "response_id": "r1", "text": "Hi"})
+
+    response_events = []
+    while not any(event["type"] == "response.done" for event in response_events):
+        event = await asyncio.wait_for(queue.get(), timeout=1)
+        if event["type"] in {"text.delta", "audio.delta", "response.done"}:
+            response_events.append(event)
+
+    assert [event["type"] for event in response_events] == [
+        "text.delta",
+        "audio.delta",
+        "response.done",
+    ]
+    assert all(event["turn_id"] == started["turn_id"] for event in response_events)
+    bridge.events.unsubscribe(queue)
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_production_bridge_schedules_default_display_transcription(
+    plugin_api, monkeypatch
+):
+    upstream = FakeUpstream()
+    transcribed = threading.Event()
+
+    async def connect(_url, **_kwargs):
+        return upstream
+
+    async def no_http_close(_session_id, _port):
+        return None
+
+    def transcribe(raw):
+        transcribed.set()
+        return {"text": f"default runner received {len(raw)} bytes", "provider": "fake"}
+
+    production_bridge = plugin_api.bridge
+    assert plugin_api.VoiceBridge().transcription_runner is plugin_api.transcribe_display_audio
+    assert production_bridge.transcription_runner is plugin_api.transcribe_display_audio
+    monkeypatch.setattr(production_bridge, "connector", connect)
+    monkeypatch.setattr(production_bridge, "close_session_request", no_http_close)
+    monkeypatch.setattr(production_bridge, "transcription_runner", transcribe)
+
+    await production_bridge.start_session("")
+    queue = production_bridge.events.subscribe()
+    try:
+        snapshot = await production_bridge.submit_turn(b"\0\0\0\0")
+        transcript = None
+        while transcript is None:
+            event = await asyncio.wait_for(queue.get(), timeout=1)
+            if event["type"] == "user.transcript":
+                transcript = event
+
+        assert transcribed.is_set()
+        assert transcript["turn_id"] == snapshot["turn_id"]
+        assert transcript["text"] == "default runner received 4 bytes"
+    finally:
+        production_bridge.events.unsubscribe(queue)
+        await production_bridge.stop()
+
+
+def test_display_transcription_writes_pcm16_wav_falls_back_and_always_deletes(
+    plugin_api, tmp_path
+):
+    observed = {}
+
+    def configured(path):
+        observed["configured_path"] = path
+        return {"success": False, "transcript": "", "error": "no configured key"}
+
+    def local(path):
+        observed["local_path"] = path
+        with wave.open(path, "rb") as wav_file:
+            observed["wav"] = (
+                wav_file.getnchannels(),
+                wav_file.getsampwidth(),
+                wav_file.getframerate(),
+                wav_file.getnframes(),
+                struct.unpack("<4h", wav_file.readframes(4)),
+            )
+        return {
+            "success": True,
+            "transcript": "spoken words",
+            "provider": "faster-whisper",
+        }
+
+    result = plugin_api.transcribe_display_audio(
+        struct.pack("<4f", -1.5, -0.5, 0.5, 1.5),
+        configured_transcriber=configured,
+        local_transcriber=local,
+        temp_directory=tmp_path,
+    )
+
+    assert result == {"text": "spoken words", "provider": "faster-whisper"}
+    assert observed["configured_path"] == observed["local_path"]
+    assert observed["wav"] == (1, 2, 16_000, 4, (-32_768, -16_384, 16_384, 32_767))
+    assert not list(tmp_path.iterdir())
+
+
+def test_empty_successful_configured_transcript_does_not_invoke_fallback(
+    plugin_api, tmp_path
+):
+    local_calls = 0
+
+    def configured(_path):
+        return {"success": True, "transcript": "", "no_speech": True}
+
+    def local(_path):
+        nonlocal local_calls
+        local_calls += 1
+        return {"success": True, "transcript": "hallucinated fallback"}
+
+    result = plugin_api.transcribe_display_audio(
+        b"\0\0\0\0",
+        configured_transcriber=configured,
+        local_transcriber=local,
+        temp_directory=tmp_path,
+    )
+
+    assert result is None
+    assert local_calls == 0
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_display_transcription_is_non_blocking_and_late_result_keeps_original_turn(
+    plugin_api,
+):
+    upstream = FakeUpstream()
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    async def connect(_url, **_kwargs):
+        return upstream
+
+    def transcribe(raw):
+        if len(raw) == 4:
+            first_started.set()
+            release_first.wait(timeout=5)
+            return {"text": "first spoken turn", "provider": "fake-local"}
+        return None
+
+    bridge = plugin_api.VoiceBridge(connector=connect, transcription_runner=transcribe)
+    await bridge.start_session("")
+    queue = bridge.events.subscribe()
+
+    first_snapshot = await asyncio.wait_for(bridge.submit_turn(b"\0" * 4), timeout=0.5)
+    for _ in range(100):
+        if first_started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert first_started.is_set()
+
+    await upstream.push({"type": "response.done", "response_id": "r1", "text": "one"})
+    while bridge.snapshot()["turn_id"] is not None:
+        await asyncio.sleep(0)
+    second_snapshot = await bridge.submit_turn(b"\0" * 8)
+    release_first.set()
+
+    transcript = None
+    while transcript is None:
+        event = await asyncio.wait_for(queue.get(), timeout=1)
+        if event["type"] == "user.transcript":
+            transcript = event
+
+    assert first_snapshot["turn_id"] != second_snapshot["turn_id"]
+    assert transcript["turn_id"] == first_snapshot["turn_id"]
+    assert transcript["turn_id"] != second_snapshot["turn_id"]
+    assert transcript["text"] == "first spoken turn"
+    assert transcript["provider"] == "fake-local"
+    assert transcript["session_id"] == first_snapshot["session_id"]
+    assert transcript["generation"] == first_snapshot["generation"]
+    bridge.events.unsubscribe(queue)
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_bridge_stop_cancels_display_transcript_publication(plugin_api):
+    upstream = FakeUpstream()
+    started = threading.Event()
+    release = threading.Event()
+
+    async def connect(_url, **_kwargs):
+        return upstream
+
+    def transcribe(_raw):
+        started.set()
+        release.wait(timeout=5)
+        return {"text": "must stay private after stop", "provider": "fake"}
+
+    bridge = plugin_api.VoiceBridge(connector=connect, transcription_runner=transcribe)
+    await bridge.start_session("")
+    queue = bridge.events.subscribe()
+    await bridge.submit_turn(b"\0" * 4)
+    for _ in range(100):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+
+    await bridge.stop()
+    release.set()
+    await asyncio.sleep(0.05)
+
+    remaining = []
+    while not queue.empty():
+        remaining.append(queue.get_nowait())
+    assert not any(event["type"] == "user.transcript" for event in remaining)
+    assert not bridge._transcription_tasks
+    bridge.events.unsubscribe(queue)
 
 
 @pytest.mark.asyncio

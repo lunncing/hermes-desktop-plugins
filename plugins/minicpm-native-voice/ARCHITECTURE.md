@@ -1,16 +1,18 @@
 # Architecture and repair map
 
 This document is the durable engineering map for `minicpm-native-voice`. The
-V1 invariant is end-to-end native audio with serialized turns: microphone PCM
-goes directly to MiniCPM-o, and model PCM returns directly to Web Audio. There
-is no STT intermediary and no strict full-duplex scheduler.
+V2 preserves end-to-end native audio with serialized turns: microphone PCM
+goes directly to MiniCPM-o, and model PCM returns directly to Web Audio. A
+concurrent, display-only STT side path labels the user's turn bubble; it never
+gates, alters, or replaces MiniCPM-o input. There is no strict full-duplex
+scheduler.
 
 ## Component boundaries
 
 | Component | Owns | Does not own |
 |---|---|---|
-| Hermes Desktop plugin | Route/UI registration, user prompt and preferences, microphone acquisition, resampling, VAD, turn upload, socket consumption, playback, browser-resource cleanup | Dashboard authentication policy, upstream process ownership, model inference |
-| Hermes dashboard plugin | Authenticated HTTP/WebSocket surface, loopback-only URL construction, protocol validation, session/turn serialization, event bounds, upstream cleanup | Microphone permission, browser playback, model files |
+| Hermes Desktop plugin | Route/UI registration, bounded session-local turn history, user prompt and preferences, microphone acquisition, resampling, VAD, turn upload, socket consumption, playback, browser-resource cleanup | Dashboard authentication policy, upstream process ownership, model inference |
+| Hermes dashboard plugin | Authenticated HTTP/WebSocket surface, loopback-only URL construction, protocol validation, session/turn serialization, display-only STT task/temp-file lifecycle, event bounds, upstream cleanup | Microphone permission, browser playback, model files |
 | Local Server manager | Strict local configuration, exact child argv/environment, port conflict detection, health/init waits, ownership-safe stop | Arbitrary command input, external process adoption, persistent process recovery |
 | Companion `llama-omni-server` | Native-audio WebSocket protocol, MiniCPM-o decode, Token2Wav, HiFiGAN, session close, health/init endpoints | Hermes authentication, Desktop UI, prompt persistence |
 | Model directory | Main GGUF and the published audio, TTS, and Token2Wav/HiFiGAN files required by the audio-only `media_type=1` profile; optional vision companion file for separately verified vision use | Plugin code or configuration |
@@ -37,21 +39,29 @@ is no STT intermediary and no strict full-duplex scheduler.
 6. Desktop uploads `turn.f32le.pcm` as multipart field `file`. FastAPI/Starlette
    parses it into a spooled `UploadFile` before the route runs, so the framework
    may use operating-system temporary-file storage. The route then performs its
-   bounded read, closes the upload, validates before Base64 encoding, and sends
-   one `input.append`.
-7. The reader forwards bounded text/audio deltas in order. Desktop validates
-   Base64 and byte/duration headroom before creating Web Audio buffers.
+   bounded read, closes the upload, validates before Base64 encoding, assigns a
+   unique `turn_id`, publishes `turn.started`, and sends one `input.append`.
+   Only after upstream acceptance, a worker converts the same validated PCM to
+   a bounded temporary PCM16 WAV for display-only Hermes transcription; the WAV
+   is always deleted and transcription never changes the native model payload.
+7. The reader forwards bounded text/audio deltas in order with `turn_id`.
+   Desktop routes them into a session-local history bounded to 100 turns,
+   1 MiB of combined user/assistant UTF-8 text, and 64 KiB per field, evicting
+   oldest completed turns first. It validates Base64 and byte/duration headroom
+   before Web Audio allocation.
 8. `response.done` marks upstream generation complete, but Desktop remains
    `speaking` until every scheduled Web Audio source reports `onended` and the
-   local playback queue drains. It then returns to `listening`. **Interrupt**
-   explicitly discards playback, closes/recreates the upstream session, and
-   preserves the exact user prompt. **End**, unmount, errors, and disable
-   dispose owned resources.
+   local playback queue drains. Later text/audio deltas and duplicate done
+   events cannot mutate that completed turn, while late display STT may still
+   update its matching user bubble. It then returns to `listening`.
+   **Interrupt** explicitly discards playback, closes/recreates the upstream
+   session, and preserves the exact user prompt. **End**, unmount, errors, and
+   disable dispose owned resources.
 
-The bridge uses a monotonically increasing generation plus a session ID to
-ignore late reader events, poll completions, and socket traffic from old
-sessions. Desktop has a separate serialized lifecycle lane and cancellation
-epoch for the same purpose.
+The bridge uses a monotonically increasing generation plus session and turn
+IDs to ignore late reader events, poll completions, socket traffic, and display
+transcripts from the wrong owner. Desktop has a separate serialized lifecycle
+lane and cancellation epoch for the same purpose.
 
 ## Source map and symptom routing
 
@@ -104,7 +114,7 @@ unauthenticated bypass.
 | `POST /session/start` | JSON `system_prompt` string of at most 65,536 UTF-8 bytes; optional strict integer `port` | Creates one audio-only, TTS-enabled upstream session; over-limit prompts and extra JSON fields are rejected |
 | `POST /turn` | multipart field `file`, required `application/octet-stream`, native PCM | Accepts one turn only when a session exists and no turn is active |
 | `POST /session/stop` | empty JSON | Idempotently cancels the reader, requests upstream close, closes the socket, and clears state |
-| `WS /events` | authenticated upgrade | Initial `status`, then ordered `state`, `text.delta`, `audio.delta`, `response.done`, or `error` objects |
+| `WS /events` | authenticated upgrade | Initial `status`, then ordered `state`, `turn.started`, `text.delta`, `audio.delta`, `user.transcript`, `response.done`, or `error` objects |
 
 HTTP error mapping is deliberate: malformed requests/config are `400`, a
 missing or unexpected upload part media type is `415`, upload overflow is
@@ -125,12 +135,15 @@ The turn is little-endian IEEE-754 Float32 PCM, mono, 16,000 samples/second.
 It is sent as a single multipart file named `turn.f32le.pcm` in field `file`.
 
 Every event emitted by the bridge includes `type`; session events also carry
-`seq`, `session_id`, and `generation`. Relevant event fields are:
+`seq`, `session_id`, and `generation`. Turn events carry the unique `turn_id`.
+Relevant event fields are:
 
 - `state`: `state` and optional `reason`;
-- `text.delta`: `text` and bounded numeric `metrics`;
-- `audio.delta`: Base64 `audio`, positive integer `sample_rate`, and metrics;
-- `response.done`: optional `response_id`, complete bounded `text`, metrics;
+- `turn.started`: bounded `duration_seconds`;
+- `text.delta`: `turn_id`, `text`, and bounded numeric `metrics`;
+- `audio.delta`: `turn_id`, Base64 `audio`, positive integer `sample_rate`, and metrics;
+- `user.transcript`: `turn_id`, bounded display text, and bounded provider label;
+- `response.done`: `turn_id`, optional `response_id`, complete bounded `text`, metrics;
 - `error`: bounded `code` and `message`.
 
 Desktop accepts events only when session ID and generation match the active
@@ -219,14 +232,16 @@ and incoming queue depth is eight.
 | Experimental barge-in | Off by default; 300 ms sustained speech and 500 ms bounded pre-roll |
 | Per-subscriber queue | 64 events and 12 MiB serialized bytes; overflow clears pending items, emits one explicit error, then rejects later items for that subscriber |
 | Text | 8 KiB UTF-8 per delta, 64 KiB current-turn total; truncation preserves valid UTF-8 |
+| Display-only STT | Validated input is converted in a worker to a mono 16 kHz PCM16 temporary WAV; configured Hermes STT is tried first, then only the already-installed local fallback; the plugin never configures cloud access, installs a package, or downloads a model; text is 64 KiB UTF-8 maximum and failures are silent |
+| Desktop history | Session-local only; at most 100 turns, 64 KiB UTF-8 per user/assistant field, and 1 MiB across all combined field text; oldest completed turns are evicted first, the active pending turn is never dropped or mutated to fit history, completed assistant text/audio are frozen, and late display STT may update the matching user field; cleared by runtime recreation, not response/session completion |
 | User-owned prompt | Exact empty/whitespace semantics; maximum 65,536 UTF-8 bytes at Desktop storage/start and backend API; over-limit values are rejected without trimming, truncation, or normalization |
 | Generated audio | Valid Base64, aligned Float32, 1 MiB decoded per delta, 8 MiB per turn; encoded length checked before decode |
-| Playback | 30 seconds and 8 MiB raw Float32 scheduled; incoming Base64 and remaining queue/duration/turn headroom checked before allocation |
+| Playback | 75 seconds and 8 MiB raw Float32 scheduled; a bounded 30 ms first-source lead-in is reapplied after drain/interrupt; incoming Base64 and remaining queue/duration/turn headroom are checked before allocation |
 | Sample rate | Positive upstream integer; missing/invalid value falls back to 24,000 Hz |
 | Metrics | At most 32 string keys; keys at most 64 characters; numeric/boolean values only |
 | Public errors/status | Messages bounded; Server status omits config paths, argv, environment, prompt, and logs |
-| Persistence | Plugin storage contains only the prompt and two preferences. Multipart parsing may temporarily spool microphone audio to the OS temp directory, and the companion Server may write under its configured output/log paths; none is a never-disk boundary |
-| Cleanup | Tracks, nodes, sources, contexts, timers, subscribers, tasks, clients, sockets, and `UploadFile`/spooled temporary files are released by their owning lifecycle; owned child/log state is released only after exit is confirmed and otherwise remains owned for a safe retry; host temp-file remanence and external Server output retention remain subject to local policy |
+| Persistence | Plugin storage contains only the prompt and two preferences; turn history is memory-only. Multipart parsing and display STT use OS temporary storage, and the companion Server may write under its configured output/log paths; none is a never-disk boundary |
+| Cleanup | Tracks, nodes, sources, contexts, timers, subscribers, STT tasks/WAVs, clients, sockets, and `UploadFile`/spooled temporary files are released by their owning lifecycle; owned child/log state is released only after exit is confirmed and otherwise remains owned for a safe retry; host temp-file remanence and external Server output retention remain subject to local policy |
 
 Do not expose port `9060` beyond loopback, add an arbitrary upstream URL, pass
 Server arguments from the UI, adopt a process by PID/port, or weaken Hermes

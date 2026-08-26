@@ -10,7 +10,7 @@ import {
   Textarea,
   host
 } from '@hermes/plugin-sdk'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Fragment, jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'minicpm-native-voice'
@@ -22,13 +22,19 @@ const DEFAULT_SILENCE_MS = 4_000
 const MIN_SILENCE_MS = 2_000
 const MAX_SILENCE_MS = 6_000
 const FALLBACK_PLAYBACK_RATE = 24_000
-const MAX_PLAYBACK_SECONDS = 30
+const MAX_PLAYBACK_SECONDS = 75
+const DEFAULT_FIRST_SOURCE_LEAD_SECONDS = 0.03
+const MAX_FIRST_SOURCE_LEAD_SECONDS = 0.25
 const MAX_AUDIO_DELTA_BYTES = 1024 * 1024
 const MAX_PLAYBACK_RAW_BYTES = 8 * 1024 * 1024
 const SERVER_START_TIMEOUT_MS = 210_000
 const SERVER_STOP_TIMEOUT_MS = 20_000
 const SERVER_POLL_TIMEOUT_MS = 5_000
 const MAX_SYSTEM_PROMPT_BYTES = 65_536
+const MAX_TURNS = 100
+const TURN_TEXT_MAX_BYTES = 65_536
+const HISTORY_TEXT_MAX_BYTES = 1024 * 1024
+const HISTORY_BOTTOM_THRESHOLD_PX = 48
 const SYSTEM_PROMPT_LIMIT_ERROR = 'System prompt exceeds the maximum of 65,536 UTF-8 bytes.'
 const USER_OWNED_MODEL_PROMPT_KEY = 'userOwnedModelPrompt'
 
@@ -44,6 +50,21 @@ function utf8ByteLength(value) {
     } else bytes += 3
   }
   return bytes
+}
+
+function utf8Prefix(value, maxBytes) {
+  const text = String(value || '')
+  if (maxBytes <= 0) return ''
+  let bytes = 0
+  let result = ''
+  for (const character of text) {
+    const code = character.codePointAt(0)
+    const size = code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4
+    if (bytes + size > maxBytes) break
+    result += character
+    bytes += size
+  }
+  return result
 }
 
 function validateSystemPrompt(value) {
@@ -214,11 +235,16 @@ export function createCaptureAccumulator(maxSamples = MAX_CAPTURE_SAMPLES) {
 
 export function createPlaybackQueue(audioContext, {
   maxQueuedSeconds = MAX_PLAYBACK_SECONDS,
-  maxQueuedBytes = MAX_PLAYBACK_RAW_BYTES
+  maxQueuedBytes = MAX_PLAYBACK_RAW_BYTES,
+  firstSourceLeadSeconds = DEFAULT_FIRST_SOURCE_LEAD_SECONDS
 } = {}) {
   if (!audioContext || maxQueuedSeconds <= 0 || !Number.isInteger(maxQueuedBytes) || maxQueuedBytes <= 0) {
     throw new RangeError('invalid playback queue')
   }
+  if (
+    !Number.isFinite(firstSourceLeadSeconds) || firstSourceLeadSeconds < 0 ||
+    firstSourceLeadSeconds > MAX_FIRST_SOURCE_LEAD_SECONDS
+  ) throw new RangeError('invalid playback lead-in')
   const sources = new Set()
   const drainWaiters = new Set()
   let nextTime = audioContext.currentTime
@@ -228,6 +254,7 @@ export function createPlaybackQueue(audioContext, {
 
   const resolveDrainWaiters = () => {
     if (sources.size) return
+    nextTime = audioContext.currentTime
     for (const resolve of drainWaiters) resolve()
     drainWaiters.clear()
   }
@@ -247,7 +274,9 @@ export function createPlaybackQueue(audioContext, {
       try {
         source.buffer = buffer
         source.connect(audioContext.destination)
-        const startsAt = Math.max(audioContext.currentTime, nextTime)
+        const startsAt = sources.size
+          ? Math.max(audioContext.currentTime, nextTime)
+          : audioContext.currentTime + firstSourceLeadSeconds
         source.onended = () => {
           if (!sources.delete(source)) return
           queuedSeconds = Math.max(0, queuedSeconds - duration)
@@ -283,7 +312,10 @@ export function createPlaybackQueue(audioContext, {
       return new Promise(resolve => drainWaiters.add(resolve))
     },
     snapshot() {
-      return { queuedSeconds, queuedBytes, nextTime, sourceCount: sources.size, droppedChunks, maxQueuedSeconds, maxQueuedBytes }
+      return {
+        queuedSeconds, queuedBytes, nextTime, sourceCount: sources.size, droppedChunks,
+        maxQueuedSeconds, maxQueuedBytes, firstSourceLeadSeconds
+      }
     }
   }
 }
@@ -427,6 +459,10 @@ export function createVoiceRuntime({
   }
   let assistantText = ''
   let userTranscript = ''
+  const turns = []
+  let activeTurn = null
+  let localTurnCounter = 0
+  let historyTextBytes = 0
   let microphoneLevel = 0
   let metrics = {}
   let errorMessage = storedPromptRejected ? SYSTEM_PROMPT_LIMIT_ERROR : ''
@@ -466,18 +502,81 @@ export function createVoiceRuntime({
 
   const snapshot = () => ({
     state, active, muted, manuallyStopped, bargeIn, silenceMs, assistantText,
-    userTranscript, microphoneLevel, metrics, systemPrompt, errorMessage,
+    userTranscript, turns: turns.map(turn => ({
+      id: turn.id,
+      userText: turn.userText,
+      assistantText: turn.assistantText,
+      complete: turn.complete
+    })), microphoneLevel, metrics, systemPrompt, errorMessage,
     session_id: sessionId, generation: backendGeneration, busy: pendingOperations > 0,
     server: { ...server }, serverBusy: serverPendingOperations > 0,
     playback: playback?.snapshot?.() || { queuedSeconds: 0, queuedBytes: 0, droppedChunks: 0 }
   })
   const notify = () => { const value = snapshot(); for (const listener of listeners) listener(value) }
   const setState = value => { state = value; notify() }
+  const syncCompatibilityFields = () => {
+    assistantText = activeTurn?.assistantText || ''
+    userTranscript = activeTurn?.userText || ''
+  }
+  const findTurn = turnId => (
+    typeof turnId === 'string' && turnId ? turns.find(turn => turn.id === turnId) || null : null
+  )
+  const replaceTurnText = (turn, field, value) => {
+    historyTextBytes -= utf8ByteLength(turn[field])
+    turn[field] = value
+    historyTextBytes += utf8ByteLength(value)
+  }
+  const trimHistory = () => {
+    const pendingTurn = activeTurn && !activeTurn.complete ? activeTurn : null
+    while (turns.length > MAX_TURNS || historyTextBytes > HISTORY_TEXT_MAX_BYTES) {
+      const oldestEvictableIndex = turns.findIndex(turn => turn !== pendingTurn)
+      if (oldestEvictableIndex < 0) break
+      const [removed] = turns.splice(oldestEvictableIndex, 1)
+      historyTextBytes -= utf8ByteLength(removed.userText) + utf8ByteLength(removed.assistantText)
+    }
+  }
+  const completePendingTurn = (turn, fallbackText) => {
+    if (!turn || turn.complete) return false
+    if (!turn.assistantText) replaceTurnText(turn, 'assistantText', fallbackText)
+    turn.complete = true
+    trimHistory()
+    if (turn === activeTurn) syncCompatibilityFields()
+    return true
+  }
+  const createPendingTurn = durationSeconds => {
+    const duration = Number.isFinite(durationSeconds) && durationSeconds >= 0 ? durationSeconds : 0
+    const turn = {
+      id: `local-${++localTurnCounter}`,
+      pendingId: true,
+      userText: `Native audio · ${duration.toFixed(1)} s`,
+      assistantText: '',
+      complete: false
+    }
+    turns.push(turn)
+    historyTextBytes += utf8ByteLength(turn.userText)
+    activeTurn = turn
+    trimHistory()
+    syncCompatibilityFields()
+    return turn
+  }
+  const reconcileTurn = turnId => {
+    if (typeof turnId !== 'string' || !turnId) return null
+    const existing = findTurn(turnId)
+    if (existing) return existing
+    const pending = activeTurn?.pendingId
+      ? activeTurn
+      : [...turns].reverse().find(turn => turn.pendingId && !turn.complete)
+    if (!pending) return null
+    pending.id = turnId
+    pending.pendingId = false
+    if (pending === activeTurn) syncCompatibilityFields()
+    return pending
+  }
   const resetUtterance = ({ clearUser = false } = {}) => {
     vad = createVad({ silenceMs })
     accumulator = createCaptureAccumulator()
     preRoll.clear()
-    if (clearUser) userTranscript = ''
+    if (clearUser && !activeTurn) userTranscript = ''
     bargeSpeechMs = 0
   }
 
@@ -619,6 +718,7 @@ export function createVoiceRuntime({
   }
 
   async function performEnd(epoch, { finalState = 'shell_ready', callBackend = backendOwned } = {}) {
+    completePendingTurn(activeTurn, finalState === 'error' ? 'Turn failed.' : 'Turn interrupted.')
     manuallyStopped = true
     active = false
     backendOwned = false
@@ -652,19 +752,28 @@ export function createVoiceRuntime({
     if (!owns(operation) || !active || muted || !vad.snapshot().speechStarted) return false
     const samples = accumulator.samples()
     if (!samples.length) return false
-    userTranscript = `Native audio · ${(samples.length / TARGET_SAMPLE_RATE).toFixed(1)} s`
+    const pendingTurn = createPendingTurn(samples.length / TARGET_SAMPLE_RATE)
     setState('thinking')
     resetUtterance()
     try {
-      await rest('/turn', {
+      const result = await rest('/turn', {
         method: 'POST',
         upload: { filename: 'turn.f32le.pcm', contentType: 'application/octet-stream', bytes: float32ToBytes(samples) },
         timeoutMs: 130_000
       })
-      if (!owns(operation)) return false
+      if (!owns(operation)) {
+        if (completePendingTurn(pendingTurn, 'Turn interrupted.')) notify()
+        return false
+      }
+      if (pendingTurn === activeTurn) reconcileTurn(result?.turn_id)
+      notify()
       return true
     } catch (error) {
-      if (!owns(operation)) return false
+      if (!owns(operation)) {
+        if (completePendingTurn(pendingTurn, 'Turn interrupted.')) notify()
+        return false
+      }
+      completePendingTurn(pendingTurn, 'Turn failed.')
       await failCurrent(operation, error)
       throw error
     }
@@ -717,6 +826,7 @@ export function createVoiceRuntime({
 
   async function restartSessionForInterrupt(operation, preserveSpeech) {
     if (!owns(operation) || !active) return snapshot()
+    completePendingTurn(activeTurn, 'Turn interrupted.')
     if (preserveSpeech) {
       const retained = preRoll.samples()
       accumulator = createCaptureAccumulator(MAX_CAPTURE_SAMPLES + retained.length)
@@ -961,7 +1071,6 @@ export function createVoiceRuntime({
         const operation = beginOperation(scheduledEpoch)
         let backendCreated = false
         manuallyStopped = false
-        assistantText = ''
         errorMessage = ''
         receivedAudioBytes = 0
         resetUtterance({ clearUser: true })
@@ -1014,6 +1123,7 @@ export function createVoiceRuntime({
       })
     },
     interrupt() {
+      if (active && completePendingTurn(activeTurn, 'Turn interrupted.')) notify()
       const epoch = cancellationEpoch
       return enqueue(epoch, async scheduledEpoch => {
         if (scheduledEpoch !== cancellationEpoch || disposed || !active) return snapshot()
@@ -1075,9 +1185,19 @@ export function createVoiceRuntime({
         ) state = event.state
         if (event.metrics && typeof event.metrics === 'object') metrics = event.metrics
       } else if (event.type === 'text.delta') {
-        assistantText = (assistantText + String(event.text || '')).slice(0, 65_536)
+        const turn = findTurn(event.turn_id)
+        if (!turn || turn.complete) return
+        replaceTurnText(
+          turn,
+          'assistantText',
+          utf8Prefix(turn.assistantText + String(event.text || ''), TURN_TEXT_MAX_BYTES)
+        )
+        trimHistory()
+        if (turn === activeTurn) syncCompatibilityFields()
         if (event.metrics && typeof event.metrics === 'object') metrics = event.metrics
       } else if (event.type === 'audio.delta') {
+        const turn = findTurn(event.turn_id)
+        if (!turn || turn !== activeTurn || turn.complete) return
         const rate = Number.isInteger(event.sample_rate) && event.sample_rate > 0 ? event.sample_rate : FALLBACK_PLAYBACK_RATE
         try {
           const playbackState = playback?.snapshot?.() || {}
@@ -1095,8 +1215,16 @@ export function createVoiceRuntime({
         }
         if (event.metrics && typeof event.metrics === 'object') metrics = event.metrics
       } else if (event.type === 'response.done') {
-        if (typeof event.text === 'string') assistantText = event.text.slice(0, 65_536)
+        const turn = findTurn(event.turn_id)
+        if (!turn || turn.complete) return
+        if (typeof event.text === 'string') {
+          replaceTurnText(turn, 'assistantText', utf8Prefix(event.text, TURN_TEXT_MAX_BYTES))
+        }
+        turn.complete = true
+        trimHistory()
+        if (turn === activeTurn) syncCompatibilityFields()
         if (event.metrics && typeof event.metrics === 'object') metrics = event.metrics
+        if (turn !== activeTurn) { notify(); return }
         receivedAudioBytes = 0
         const playbackState = playback?.snapshot?.() || {}
         const playbackPending = (
@@ -1121,12 +1249,21 @@ export function createVoiceRuntime({
           awaitingPlaybackDrain = false
           state = 'ready'
         }
+      } else if (event.type === 'turn.started') {
+        reconcileTurn(event.turn_id)
+      } else if (event.type === 'user.transcript') {
+        const turn = findTurn(event.turn_id)
+        if (!turn || typeof event.text !== 'string' || !event.text) return
+        replaceTurnText(turn, 'userText', utf8Prefix(event.text, TURN_TEXT_MAX_BYTES))
+        trimHistory()
+        if (turn === activeTurn) syncCompatibilityFields()
       } else if (event.type === 'error') {
         surfaceRuntimeError(event.message || event.code)
       }
       notify()
     },
     end() {
+      if (active && completePendingTurn(activeTurn, 'Turn interrupted.')) notify()
       const epoch = invalidateOperations()
       manuallyStopped = true
       active = false
@@ -1140,6 +1277,7 @@ export function createVoiceRuntime({
     },
     dispose() {
       if (disposePromise) return disposePromise
+      if (active && completePendingTurn(activeTurn, 'Turn interrupted.')) notify()
       disposed = true
       const epoch = invalidateOperations()
       manuallyStopped = true
@@ -1163,6 +1301,9 @@ export function createVoiceRuntime({
 
 function EnglishCoachPage({ runtime }) {
   const [view, setView] = useState(() => runtime.snapshot())
+  const historyRef = useRef(null)
+  const previousLatestTurnIdRef = useRef(null)
+  const followLatestRef = useRef(true)
   useEffect(() => {
     const unsubscribe = runtime.subscribe(setView)
     return () => {
@@ -1170,6 +1311,36 @@ function EnglishCoachPage({ runtime }) {
       void runtime.end()
     }
   }, [runtime])
+  const latestTurn = view.turns?.at(-1)
+  const latestTurnId = latestTurn?.id || null
+  const latestAssistantText = latestTurn?.assistantText || ''
+  const priorTurnIds = (view.turns || []).slice(0, -1).map(turn => turn.id)
+  useEffect(() => {
+    const previousLatestTurnId = previousLatestTurnIdRef.current
+    const latestTurnChanged = latestTurnId !== previousLatestTurnId
+    const appendedTurn = latestTurnChanged && latestTurnId !== null && (
+      previousLatestTurnId === null || priorTurnIds.includes(previousLatestTurnId)
+    )
+    if (latestTurnChanged) previousLatestTurnIdRef.current = latestTurnId
+    if (appendedTurn) {
+      followLatestRef.current = true
+    } else if (!followLatestRef.current) {
+      return
+    }
+    const history = historyRef.current
+    if (!history) return
+    const frame = requestAnimationFrame(() => {
+      if (historyRef.current === history && followLatestRef.current) {
+        history.scrollTop = history.scrollHeight
+      }
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [latestTurnId, latestAssistantText])
+  const handleHistoryScroll = useCallback(event => {
+    const history = event.currentTarget
+    const distanceFromBottom = history.scrollHeight - history.scrollTop - history.clientHeight
+    followLatestRef.current = distanceFromBottom <= HISTORY_BOTTOM_THRESHOLD_PX
+  }, [])
   const act = useCallback(action => { void action().catch(() => undefined) }, [])
   const status = useMemo(() => String(view.state), [view.state])
   const serverView = view.server || normalizeServerStatus(null)
@@ -1189,7 +1360,7 @@ function EnglishCoachPage({ runtime }) {
             jsx('h1', { style: { margin: 0 }, children: 'English Coach' }),
             jsx(Badge, { children: status })
           ] }),
-          jsx('p', { style: { color: 'var(--ui-text-secondary)' }, children: 'Native audio · Turn-based streaming (V1)' })
+          jsx('p', { style: { color: 'var(--ui-text-secondary)' }, children: 'Native audio · Turn-based streaming (V2)' })
         ]
       }),
       jsxs('section', {
@@ -1242,14 +1413,48 @@ function EnglishCoachPage({ runtime }) {
         'aria-valuenow': view.microphoneLevel,
         style: { height: '0.5rem', width: `${Math.round(view.microphoneLevel * 100)}%`, minWidth: '0.25rem', background: 'var(--ui-accent)' }
       }),
-      jsxs('section', { 'aria-label': 'Current user and assistant transcript', style: { display: 'grid', gap: '0.5rem' }, children: [
-        jsxs('div', { children: [jsx('strong', { children: 'You: ' }), view.userTranscript || 'Waiting for native audio.'] }),
-        jsxs('div', { children: [jsx('strong', { children: 'Assistant: ' }), view.assistantText || 'No response yet.'] })
-      ] }),
+      jsx('section', {
+        'aria-label': 'Conversation history',
+        ref: historyRef,
+        onScroll: handleHistoryScroll,
+        style: {
+          display: 'flex', flex: '1 1 auto', flexDirection: 'column', gap: '0.75rem',
+          minHeight: 0, overflowY: 'auto', padding: '0.75rem',
+          border: '1px solid var(--ui-border)'
+        },
+        children: (view.turns || []).length
+          ? view.turns.map(turn => jsxs('div', {
+            style: { display: 'flex', flexDirection: 'column', gap: '0.375rem' },
+            children: [
+              jsx('div', {
+                'data-bubble-side': 'right', 'data-turn-id': turn.id,
+                'aria-label': `User turn ${turn.id}`,
+                style: {
+                  alignSelf: 'flex-end', maxWidth: '80%', padding: '0.625rem 0.75rem',
+                  border: '1px solid var(--ui-border)', borderRadius: '0.75rem',
+                  background: 'var(--ui-bg-secondary)', overflowWrap: 'anywhere'
+                },
+                children: turn.userText
+              }),
+              jsx('div', {
+                'data-bubble-side': 'left', 'data-turn-id': turn.id,
+                'aria-label': `Assistant turn ${turn.id}`,
+                style: {
+                  alignSelf: 'flex-start', maxWidth: '80%', padding: '0.625rem 0.75rem',
+                  border: '1px solid var(--ui-border)', borderRadius: '0.75rem',
+                  background: 'var(--ui-bg-primary)', overflowWrap: 'anywhere',
+                  color: turn.assistantText ? 'var(--ui-text-primary)' : 'var(--ui-text-secondary)'
+                },
+                children: turn.assistantText || (turn.complete ? 'No text response.' : 'Thinking…')
+              })
+            ]
+          }, turn.id))
+          : jsx('p', { style: { margin: 0, color: 'var(--ui-text-secondary)' }, children: 'Conversation turns appear here.' })
+      }),
       jsx('section', {
         'aria-label': 'Timing metrics',
         style: { fontFamily: 'var(--font-mono)', color: 'var(--ui-text-secondary)', overflowWrap: 'anywhere' },
-        children: Object.keys(view.metrics || {}).length ? JSON.stringify(view.metrics) : 'Timing metrics appear when supplied.'
+        children: Object.keys(view.metrics || {}).length ? 'Timing metrics received for the latest response.' : 'Timing metrics appear when supplied.'
       }),
       view.errorMessage ? jsx('p', { role: 'alert', children: view.errorMessage }) : null
     ]
@@ -1258,6 +1463,7 @@ function EnglishCoachPage({ runtime }) {
 
 export const __test = {
   EnglishCoachPage,
+  HISTORY_TEXT_MAX_BYTES,
   MAX_SYSTEM_PROMPT_BYTES,
   buildSessionStartRequest,
   bytesToFloat32,

@@ -6,6 +6,23 @@ const vm = require('node:vm')
 
 const PLUGIN_PATH = path.join(__dirname, '..', 'desktop', 'plugin.js')
 
+test('production React hook identifiers are imported from react', () => {
+  const source = fs.readFileSync(PLUGIN_PATH, 'utf8')
+  const reactImport = source.match(/import\s*{([\s\S]*?)}\s*from\s*['"]react['"]/)
+  assert.ok(reactImport, 'production source must have a named import from react')
+
+  const importedHooks = new Set(
+    [...reactImport[1].matchAll(/\buse[A-Z][A-Za-z0-9_]*\b/g)].map(match => match[0])
+  )
+  const productionBody = source.replace(reactImport[0], '')
+  const usedHooks = [
+    ...new Set([...productionBody.matchAll(/\buse[A-Z][A-Za-z0-9_]*\b/g)].map(match => match[0]))
+  ].sort()
+  const missingHooks = usedHooks.filter(hook => !importedHooks.has(hook))
+
+  assert.deepEqual(missingHooks, [], `React hooks missing from the production import: ${missingHooks.join(', ')}`)
+})
+
 function loadPlugin(overrides = {}) {
   let source = fs.readFileSync(PLUGIN_PATH, 'utf8')
   source = source.replace(/^import[\s\S]*?from ['"][^'"]+['"]\s*$/gm, '')
@@ -91,6 +108,103 @@ function elementText(value) {
   if (typeof value === 'string' || typeof value === 'number') return String(value)
   if (Array.isArray(value)) return value.map(elementText).join('')
   return elementText(value.props?.children)
+}
+
+function createHookRenderer() {
+  const hooks = []
+  let component = null
+  let props = null
+  let cursor = 0
+  let pendingEffects = []
+  let output = null
+
+  const dependenciesChanged = (previous, next) => (
+    !previous || !next || previous.length !== next.length ||
+    previous.some((value, index) => !Object.is(value, next[index]))
+  )
+  const react = {
+    useCallback(value, dependencies) {
+      return react.useMemo(() => value, dependencies)
+    },
+    useEffect(effect, dependencies) {
+      const index = cursor++
+      const hook = hooks[index]
+      if (!hook || dependenciesChanged(hook.dependencies, dependencies)) {
+        pendingEffects.push({ index, effect, dependencies })
+      }
+    },
+    useMemo(factory, dependencies) {
+      const index = cursor++
+      const hook = hooks[index]
+      if (!hook || dependenciesChanged(hook.dependencies, dependencies)) {
+        hooks[index] = { value: factory(), dependencies }
+      }
+      return hooks[index].value
+    },
+    useRef(initial) {
+      const index = cursor++
+      if (!hooks[index]) hooks[index] = { current: initial }
+      return hooks[index]
+    },
+    useState(initial) {
+      const index = cursor++
+      if (!hooks[index]) {
+        hooks[index] = { value: typeof initial === 'function' ? initial() : initial }
+      }
+      const setValue = value => {
+        hooks[index].value = typeof value === 'function' ? value(hooks[index].value) : value
+      }
+      return [hooks[index].value, setValue]
+    }
+  }
+  const commitEffects = () => {
+    for (const pending of pendingEffects) {
+      const previous = hooks[pending.index]
+      previous?.cleanup?.()
+      hooks[pending.index] = {
+        dependencies: pending.dependencies,
+        cleanup: pending.effect()
+      }
+    }
+    pendingEffects = []
+  }
+
+  return {
+    react,
+    render(nextComponent = component, nextProps = props) {
+      component = nextComponent
+      props = nextProps
+      cursor = 0
+      output = component(props)
+      commitEffects()
+      return output
+    },
+    output: () => output,
+    unmount() {
+      for (const hook of hooks) hook?.cleanup?.()
+    }
+  }
+}
+
+function createRafHarness() {
+  const callbacks = new Map()
+  let nextId = 0
+  return {
+    requestAnimationFrame(callback) {
+      const id = ++nextId
+      callbacks.set(id, callback)
+      return id
+    },
+    cancelAnimationFrame(id) {
+      callbacks.delete(id)
+    },
+    flush() {
+      const scheduled = [...callbacks.values()]
+      callbacks.clear()
+      for (const callback of scheduled) callback()
+    },
+    pending: () => callbacks.size
+  }
 }
 
 class FakeAudioContext {
@@ -250,8 +364,45 @@ test('playback schedules chunks in arrival order and respects each sample rate',
   assert.equal(playback.enqueue(new Float32Array(16_000).fill(0.2), 16_000), true)
 
   assert.deepEqual(context.buffers.map(buffer => buffer.sampleRate), [24_000, 16_000])
-  assert.deepEqual(context.sources.map(source => source.starts[0]), [0, 1])
+  assert.deepEqual(context.sources.map(source => source.starts[0]), [0.03, 1.03])
   assert.equal(playback.snapshot().queuedSeconds, 2)
+})
+
+test('playback reapplies bounded first-source lead-in after drain and interrupt', () => {
+  const { testApi } = loadPlugin()
+  const context = new FakeAudioContext()
+  const playback = testApi.createPlaybackQueue(context, { maxQueuedSeconds: 75 })
+
+  playback.enqueue(new Float32Array(24_000), 24_000)
+  assert.equal(context.sources[0].starts[0], 0.03)
+  context.currentTime = 1
+  context.sources[0].onended()
+  playback.enqueue(new Float32Array(24_000), 24_000)
+  assert.equal(context.sources[1].starts[0], 1.03)
+
+  context.currentTime = 2
+  playback.interrupt()
+  playback.enqueue(new Float32Array(24_000), 24_000)
+  assert.equal(context.sources[2].starts[0], 2.03)
+  assert.throws(
+    () => testApi.createPlaybackQueue(context, { firstSourceLeadSeconds: 1 }),
+    /lead-in/
+  )
+})
+
+test('default playback accepts 60 seconds completely and rejects over 75 seconds before buffer creation', () => {
+  const { testApi } = loadPlugin()
+  const acceptedContext = new FakeAudioContext()
+  const accepted = testApi.createPlaybackQueue(acceptedContext)
+  assert.equal(accepted.enqueue(new Float32Array(60 * 24_000), 24_000), true)
+  assert.equal(accepted.snapshot().queuedSeconds, 60)
+  assert.equal(acceptedContext.buffers.length, 1)
+
+  const rejectedContext = new FakeAudioContext()
+  const rejected = testApi.createPlaybackQueue(rejectedContext)
+  assert.equal(rejected.enqueue(new Float32Array(76 * 16_000), 16_000), false)
+  assert.equal(rejectedContext.buffers.length, 0)
+  assert.equal(rejected.snapshot().droppedChunks, 1)
 })
 
 test('interrupt immediately stops sources and clears playback schedule', () => {
@@ -690,7 +841,7 @@ test('registration and source policy match the native page contract', () => {
   const imports = [...source.matchAll(/from\s+['"]([^'"]+)['"]/g)].map(match => match[1])
   assert.deepEqual([...new Set(imports)].sort(), ['@hermes/plugin-sdk', 'react', 'react/jsx-runtime'].sort())
   assert.doesNotMatch(source, /#[0-9a-fA-F]{3,8}\b|\brgb\s*\(|\b(?:black|white)\b/)
-  for (const label of ["Start", "Mute", "I'm done", "Interrupt", "End", "Native audio · Turn-based streaming (V1)"]) {
+  for (const label of ["Start", "Mute", "I'm done", "Interrupt", "End", "Native audio · Turn-based streaming (V2)"]) {
     assert.match(source, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
   }
 })
@@ -767,6 +918,627 @@ test('English Coach route renders a clean title in a contained main shell withou
   }
 })
 
+test('turn history reconciles ids and isolates late events without deleting prior turns', async () => {
+  const { testApi } = loadPlugin()
+  let eventHandler = null
+  let onFrame = null
+  let turnNumber = 0
+  const playedAudio = []
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/session/start') return { state: 'listening', session_id: 's1', generation: 1 }
+      if (path === '/turn') return { state: 'thinking', session_id: 's1', generation: 1, turn_id: `turn-${++turnNumber}` }
+      return { state: 'shell_ready', session_id: null, generation: 2 }
+    },
+    storage: { get: (_key, fallback) => fallback, set() {} },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({
+      enqueue(samples, rate) { playedAudio.push([samples.length, rate]); return true },
+      interrupt() {}, snapshot() { return {} }, cleanup: async () => {}
+    })
+  })
+  runtime.bindSocket((_path, handler) => { eventHandler = handler; return () => {} })
+  await runtime.start('')
+
+  onFrame(new Float32Array(1_600).fill(0.2), 0.2)
+  const firstSubmit = runtime.manualDone()
+  await until(() => runtime.snapshot().turns.length === 1)
+  assert.equal(runtime.snapshot().turns[0].userText, 'Native audio · 0.1 s')
+  assert.equal(runtime.snapshot().turns[0].assistantText, '')
+  assert.equal(runtime.snapshot().turns[0].complete, false)
+  eventHandler({ type: 'turn.started', turn_id: 'turn-1', duration_seconds: 0.1, session_id: 's1', generation: 1 })
+  eventHandler({ type: 'turn.started', turn_id: 'turn-1', duration_seconds: 0.1, session_id: 's1', generation: 1 })
+  await firstSubmit
+  assert.equal(runtime.snapshot().turns.length, 1)
+  assert.equal(runtime.snapshot().turns[0].id, 'turn-1')
+
+  eventHandler({ type: 'text.delta', turn_id: 'turn-1', text: 'First', session_id: 's1', generation: 1 })
+  eventHandler({ type: 'response.done', turn_id: 'turn-1', text: 'First complete', session_id: 's1', generation: 1 })
+  eventHandler({ type: 'text.delta', turn_id: 'turn-1', text: ' stale tail', session_id: 's1', generation: 1 })
+  assert.equal(runtime.snapshot().turns[0].assistantText, 'First complete')
+  eventHandler({ type: 'audio.delta', turn_id: 'turn-1', audio: 'AAAAAA==', sample_rate: 24_000, session_id: 's1', generation: 1 })
+  assert.equal(playedAudio.length, 0)
+  eventHandler({ type: 'response.done', turn_id: 'turn-1', text: 'duplicate rewrite', session_id: 's1', generation: 1 })
+  assert.equal(runtime.snapshot().turns[0].assistantText, 'First complete')
+
+  onFrame(new Float32Array(3_200).fill(0.2), 0.2)
+  await runtime.manualDone()
+  eventHandler({ type: 'turn.started', turn_id: 'turn-2', duration_seconds: 0.2, session_id: 's1', generation: 1 })
+  eventHandler({ type: 'text.delta', turn_id: 'turn-2', text: 'Second', session_id: 's1', generation: 1 })
+  eventHandler({ type: 'user.transcript', turn_id: 'turn-1', text: 'what I first said', provider: 'local', session_id: 's1', generation: 1 })
+
+  const view = runtime.snapshot()
+  assert.deepEqual(JSON.parse(JSON.stringify(view.turns)), [
+    { id: 'turn-1', userText: 'what I first said', assistantText: 'First complete', complete: true },
+    { id: 'turn-2', userText: 'Native audio · 0.2 s', assistantText: 'Second', complete: false }
+  ])
+  assert.equal(view.assistantText, 'Second')
+  assert.equal(view.userTranscript, 'Native audio · 0.2 s')
+  await runtime.end()
+  assert.equal(runtime.snapshot().turns.length, 2)
+  await runtime.dispose()
+})
+
+test('turn history is capped at 100 turns and each text field is UTF-8 bounded', async () => {
+  const { testApi } = loadPlugin()
+  let eventHandler = null
+  let onFrame = null
+  let turnNumber = 0
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/session/start') return { state: 'listening', session_id: 's1', generation: 1 }
+      if (path === '/turn') return { state: 'thinking', session_id: 's1', generation: 1, turn_id: `turn-${++turnNumber}` }
+      return { state: 'shell_ready', session_id: null, generation: 2 }
+    },
+    storage: { get: (_key, fallback) => fallback, set() {} },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({ enqueue() { return true }, interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+  runtime.bindSocket((_path, handler) => { eventHandler = handler; return () => {} })
+  await runtime.start('')
+
+  for (let index = 1; index <= 101; index += 1) {
+    onFrame(new Float32Array(16).fill(0.2), 0.2)
+    await runtime.manualDone()
+    eventHandler({ type: 'response.done', turn_id: `turn-${index}`, text: index === 101 ? 'é'.repeat(40_000) : `answer-${index}`, session_id: 's1', generation: 1 })
+  }
+
+  const turns = runtime.snapshot().turns
+  assert.equal(turns.length, 100)
+  assert.equal(turns[0].id, 'turn-2')
+  assert.equal(turns.at(-1).id, 'turn-101')
+  assert.equal(Buffer.byteLength(turns.at(-1).assistantText, 'utf8'), 65_536)
+  await runtime.dispose()
+})
+
+test('turn history evicts oldest completed turns to stay within a 1 MiB total UTF-8 budget', async () => {
+  const { testApi } = loadPlugin()
+  let eventHandler = null
+  let onFrame = null
+  let turnNumber = 0
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/session/start') return { state: 'listening', session_id: 's1', generation: 1 }
+      if (path === '/turn') return { state: 'thinking', session_id: 's1', generation: 1, turn_id: `turn-${++turnNumber}` }
+      return { state: 'shell_ready', session_id: null, generation: 2 }
+    },
+    storage: { get: (_key, fallback) => fallback, set() {} },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({ enqueue() { return true }, interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+  runtime.bindSocket((_path, handler) => { eventHandler = handler; return () => {} })
+  await runtime.start('')
+
+  const field = 'é'.repeat(32_768)
+  for (let index = 1; index <= 9; index += 1) {
+    onFrame(new Float32Array(16).fill(0.2), 0.2)
+    await runtime.manualDone()
+    if (index === 9) {
+      const pending = runtime.snapshot().turns.at(-1)
+      assert.equal(pending.id, 'turn-9')
+      assert.equal(pending.complete, false)
+    }
+    eventHandler({ type: 'user.transcript', turn_id: `turn-${index}`, text: field, provider: 'local', session_id: 's1', generation: 1 })
+    eventHandler({ type: 'response.done', turn_id: `turn-${index}`, text: field, session_id: 's1', generation: 1 })
+  }
+
+  const turns = runtime.snapshot().turns
+  const totalTextBytes = turns.reduce(
+    (total, turn) => total + Buffer.byteLength(turn.userText + turn.assistantText, 'utf8'),
+    0
+  )
+  assert.equal(turns.length, 8)
+  assert.equal(turns[0].id, 'turn-2')
+  assert.equal(turns.at(-1).id, 'turn-9')
+  assert.equal(totalTextBytes, 1024 * 1024)
+  await runtime.dispose()
+})
+
+test('turn history evicts stale incomplete turns before the active pending turn', async () => {
+  const { testApi } = loadPlugin()
+  let eventHandler = null
+  let onFrame = null
+  let turnNumber = 0
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/session/start') return { state: 'listening', session_id: 's1', generation: 1 }
+      if (path === '/turn') return { state: 'thinking', session_id: 's1', generation: 1, turn_id: `turn-${++turnNumber}` }
+      return { state: 'shell_ready', session_id: null, generation: 2 }
+    },
+    storage: { get: (_key, fallback) => fallback, set() {} },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+  runtime.bindSocket((_path, handler) => { eventHandler = handler; return () => {} })
+  await runtime.start('')
+
+  const field = 'x'.repeat(65_536)
+  for (let index = 1; index <= 9; index += 1) {
+    onFrame(new Float32Array(16).fill(0.2), 0.2)
+    await runtime.manualDone()
+    eventHandler({ type: 'user.transcript', turn_id: `turn-${index}`, text: field, provider: 'local', session_id: 's1', generation: 1 })
+    eventHandler({ type: 'text.delta', turn_id: `turn-${index}`, text: field, session_id: 's1', generation: 1 })
+    if (index < 9) eventHandler({ type: 'state', state: 'listening', session_id: 's1', generation: 1 })
+  }
+
+  const turns = runtime.snapshot().turns
+  const totalTextBytes = turns.reduce(
+    (total, turn) => total + Buffer.byteLength(turn.userText + turn.assistantText, 'utf8'),
+    0
+  )
+  assert.equal(turns.length, 8)
+  assert.equal(turns[0].id, 'turn-2')
+  assert.equal(turns.at(-1).id, 'turn-9')
+  assert.equal(turns.at(-1).complete, false)
+  assert.equal(totalTextBytes, 1024 * 1024)
+  await runtime.dispose()
+})
+
+test('repeated failed submissions stay within the 100-turn and 1 MiB text budgets', async () => {
+  const { testApi } = loadPlugin()
+  let eventHandler = null
+  let onFrame = null
+  let starts = 0
+  let turnCalls = 0
+  let turnResponse = null
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/session/start') {
+        starts += 1
+        return { state: 'listening', session_id: `s${starts}`, generation: starts }
+      }
+      if (path === '/turn') {
+        turnCalls += 1
+        return turnResponse.promise
+      }
+      return { state: 'shell_ready', session_id: null, generation: starts + 1 }
+    },
+    storage: { get: (_key, fallback) => fallback, set() {} },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+  runtime.bindSocket((_path, handler) => { eventHandler = handler; return () => {} })
+
+  const field = 'y'.repeat(65_536)
+  let maxTurnCount = 0
+  for (let index = 1; index <= 101; index += 1) {
+    await runtime.start('')
+    onFrame(new Float32Array(16).fill(0.2), 0.2)
+    turnResponse = deferred()
+    const submitting = runtime.manualDone()
+    await until(() => turnCalls === index)
+    maxTurnCount = Math.max(maxTurnCount, runtime.snapshot().turns.length)
+    eventHandler({ type: 'turn.started', turn_id: `turn-${index}`, session_id: `s${index}`, generation: index })
+    if (index >= 93) {
+      eventHandler({ type: 'user.transcript', turn_id: `turn-${index}`, text: field, provider: 'local', session_id: `s${index}`, generation: index })
+      eventHandler({ type: 'text.delta', turn_id: `turn-${index}`, text: field, session_id: `s${index}`, generation: index })
+    }
+    turnResponse.reject(new Error(`turn ${index} failed`))
+    await assert.rejects(submitting, new RegExp(`turn ${index} failed`))
+
+    const view = runtime.snapshot()
+    const totalTextBytes = view.turns.reduce(
+      (total, turn) => total + Buffer.byteLength(turn.userText + turn.assistantText, 'utf8'),
+      0
+    )
+    assert.ok(view.turns.length <= 100)
+    assert.ok(totalTextBytes <= 1024 * 1024)
+    assert.equal(view.turns.at(-1).complete, true)
+  }
+
+  assert.equal(maxTurnCount, 100)
+  assert.equal(runtime.snapshot().turns.at(-1).id, 'turn-101')
+  assert.equal(runtime.snapshot().turns.at(-1).assistantText, field)
+  await runtime.dispose()
+})
+
+test('chat history renders chronological user-right and assistant-left bubbles in a stable scroll shell', () => {
+  const { testApi } = loadPlugin()
+  const view = {
+    state: 'thinking', active: true, muted: false, busy: false, serverBusy: false,
+    bargeIn: false, silenceMs: 4_000, assistantText: '', userTranscript: '', microphoneLevel: 0,
+    turns: [
+      { id: 'turn-1', userText: 'hello', assistantText: 'Hi there', complete: true },
+      { id: 'turn-2', userText: 'Native audio · 1.2 s', assistantText: '', complete: false }
+    ],
+    metrics: { privateShape: 1 }, systemPrompt: '', errorMessage: '',
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const page = testApi.EnglishCoachPage({
+    runtime: {
+      snapshot: () => view, subscribe: () => () => {}, startServer() {}, stopServer() {}, start() {},
+      setMuted() {}, manualDone() {}, interrupt() {}, end() {}, setSilenceMs() {}, setBargeIn() {}
+    }
+  })
+  const history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  const bubbles = descendants(history).filter(element => element.props?.['data-bubble-side'])
+
+  assert.equal(history.props.style.overflowY, 'auto')
+  assert.equal(history.props.style.minHeight, 0)
+  assert.deepEqual(bubbles.map(element => [
+    element.props['data-turn-id'], element.props['data-bubble-side'], element.props['aria-label'], elementText(element)
+  ]), [
+    ['turn-1', 'right', 'User turn turn-1', 'hello'],
+    ['turn-1', 'left', 'Assistant turn turn-1', 'Hi there'],
+    ['turn-2', 'right', 'User turn turn-2', 'Native audio · 1.2 s'],
+    ['turn-2', 'left', 'Assistant turn turn-2', 'Thinking…']
+  ])
+  assert.doesNotMatch(elementText(history), /privateShape|\{"/)
+})
+
+test('a newly appended turn scrolls only the conversation history node to its bottom', () => {
+  const renderer = createHookRenderer()
+  const raf = createRafHarness()
+  let outerScrollCalls = 0
+  let listener = null
+  let view = {
+    state: 'thinking', active: true, muted: false, busy: false, serverBusy: false,
+    bargeIn: false, silenceMs: 4_000, microphoneLevel: 0,
+    turns: [{ id: 'turn-1', userText: 'hello', assistantText: 'Hi', complete: true }],
+    metrics: {}, systemPrompt: '', errorMessage: '',
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const runtime = {
+    snapshot: () => view,
+    subscribe(callback) { listener = callback; return () => { listener = null } },
+    startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {}, interrupt() {},
+    end() {}, setSilenceMs() {}, setBargeIn() {}
+  }
+  const { testApi } = loadPlugin({
+    react: renderer.react,
+    requestAnimationFrame: callback => raf.requestAnimationFrame(callback),
+    cancelAnimationFrame: id => raf.cancelAnimationFrame(id),
+    scrollTo: () => { outerScrollCalls += 1 }
+  })
+
+  let page = renderer.render(testApi.EnglishCoachPage, { runtime })
+  let history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  const historyNode = { scrollTop: 12, scrollHeight: 240, clientHeight: 100 }
+  history.props.ref.current = historyNode
+  view = {
+    ...view,
+    turns: [
+      ...view.turns,
+      { id: 'turn-2', userText: 'new question', assistantText: '', complete: false }
+    ]
+  }
+  listener(view)
+  page = renderer.render()
+  history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  historyNode.scrollHeight = 360
+  raf.flush()
+
+  assert.equal(historyNode.scrollTop, 360)
+  assert.equal(outerScrollCalls, 0)
+  renderer.unmount()
+})
+
+test('the newest assistant draft growth follows the conversation bottom while pinned', () => {
+  const renderer = createHookRenderer()
+  const raf = createRafHarness()
+  let listener = null
+  let view = {
+    state: 'thinking', active: true, muted: false, busy: false, serverBusy: false,
+    bargeIn: false, silenceMs: 4_000, microphoneLevel: 0,
+    turns: [{ id: 'turn-1', userText: 'hello', assistantText: 'Draft', complete: false }],
+    metrics: {}, systemPrompt: '', errorMessage: '',
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const runtime = {
+    snapshot: () => view,
+    subscribe(callback) { listener = callback; return () => { listener = null } },
+    startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {}, interrupt() {},
+    end() {}, setSilenceMs() {}, setBargeIn() {}
+  }
+  const { testApi } = loadPlugin({
+    react: renderer.react,
+    requestAnimationFrame: callback => raf.requestAnimationFrame(callback),
+    cancelAnimationFrame: id => raf.cancelAnimationFrame(id)
+  })
+
+  let page = renderer.render(testApi.EnglishCoachPage, { runtime })
+  const history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  const historyNode = { scrollTop: 152, scrollHeight: 300, clientHeight: 100 }
+  history.props.ref.current = historyNode
+  history.props.onScroll({ currentTarget: historyNode })
+  view = {
+    ...view,
+    turns: [{ ...view.turns[0], assistantText: 'Draft with another streamed sentence.' }]
+  }
+  listener(view)
+  page = renderer.render()
+  historyNode.scrollHeight = 420
+  raf.flush()
+
+  assert.equal(historyNode.scrollTop, 420)
+  renderer.unmount()
+})
+
+test('manual upward history scrolling disables follow for later draft growth', () => {
+  const renderer = createHookRenderer()
+  const raf = createRafHarness()
+  let listener = null
+  let view = {
+    state: 'thinking', active: true, muted: false, busy: false, serverBusy: false,
+    bargeIn: false, silenceMs: 4_000, microphoneLevel: 0,
+    turns: [{ id: 'turn-1', userText: 'hello', assistantText: 'Draft', complete: false }],
+    metrics: {}, systemPrompt: '', errorMessage: '',
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const runtime = {
+    snapshot: () => view,
+    subscribe(callback) { listener = callback; return () => { listener = null } },
+    startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {}, interrupt() {},
+    end() {}, setSilenceMs() {}, setBargeIn() {}
+  }
+  const { testApi } = loadPlugin({
+    react: renderer.react,
+    requestAnimationFrame: callback => raf.requestAnimationFrame(callback),
+    cancelAnimationFrame: id => raf.cancelAnimationFrame(id)
+  })
+
+  let page = renderer.render(testApi.EnglishCoachPage, { runtime })
+  let history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  const historyNode = { scrollTop: 100, scrollHeight: 400, clientHeight: 100 }
+  history.props.ref.current = historyNode
+  history.props.onScroll({ currentTarget: historyNode })
+  view = {
+    ...view,
+    turns: [{ ...view.turns[0], assistantText: 'Draft with another streamed sentence.' }]
+  }
+  listener(view)
+  page = renderer.render()
+  history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  historyNode.scrollHeight = 460
+  raf.flush()
+
+  assert.equal(historyNode.scrollTop, 100)
+  assert.equal(raf.pending(), 0)
+  renderer.unmount()
+})
+
+test('manual upward scrolling wins over an already queued draft-follow frame', () => {
+  const renderer = createHookRenderer()
+  const raf = createRafHarness()
+  let listener = null
+  let view = {
+    state: 'thinking', active: true, muted: false, busy: false, serverBusy: false,
+    bargeIn: false, silenceMs: 4_000, microphoneLevel: 0,
+    turns: [{ id: 'turn-1', userText: 'hello', assistantText: 'Draft', complete: false }],
+    metrics: {}, systemPrompt: '', errorMessage: '',
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const runtime = {
+    snapshot: () => view,
+    subscribe(callback) { listener = callback; return () => { listener = null } },
+    startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {}, interrupt() {},
+    end() {}, setSilenceMs() {}, setBargeIn() {}
+  }
+  const { testApi } = loadPlugin({
+    react: renderer.react,
+    requestAnimationFrame: callback => raf.requestAnimationFrame(callback),
+    cancelAnimationFrame: id => raf.cancelAnimationFrame(id)
+  })
+
+  let page = renderer.render(testApi.EnglishCoachPage, { runtime })
+  let history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  const historyNode = { scrollTop: 200, scrollHeight: 300, clientHeight: 100 }
+  history.props.ref.current = historyNode
+  history.props.onScroll({ currentTarget: historyNode })
+  view = {
+    ...view,
+    turns: [{ ...view.turns[0], assistantText: 'Draft with another streamed sentence.' }]
+  }
+  listener(view)
+  page = renderer.render()
+  history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  historyNode.scrollTop = 80
+  historyNode.scrollHeight = 460
+  history.props.onScroll({ currentTarget: historyNode })
+  raf.flush()
+
+  assert.equal(historyNode.scrollTop, 80)
+  renderer.unmount()
+})
+
+test('a newly appended turn re-arms history follow after manual upward scrolling', () => {
+  const renderer = createHookRenderer()
+  const raf = createRafHarness()
+  let listener = null
+  let view = {
+    state: 'thinking', active: true, muted: false, busy: false, serverBusy: false,
+    bargeIn: false, silenceMs: 4_000, microphoneLevel: 0,
+    turns: [{ id: 'turn-1', userText: 'hello', assistantText: 'First answer', complete: true }],
+    metrics: {}, systemPrompt: '', errorMessage: '',
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const runtime = {
+    snapshot: () => view,
+    subscribe(callback) { listener = callback; return () => { listener = null } },
+    startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {}, interrupt() {},
+    end() {}, setSilenceMs() {}, setBargeIn() {}
+  }
+  const { testApi } = loadPlugin({
+    react: renderer.react,
+    requestAnimationFrame: callback => raf.requestAnimationFrame(callback),
+    cancelAnimationFrame: id => raf.cancelAnimationFrame(id)
+  })
+
+  let page = renderer.render(testApi.EnglishCoachPage, { runtime })
+  let history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  const historyNode = { scrollTop: 80, scrollHeight: 400, clientHeight: 100 }
+  history.props.ref.current = historyNode
+  history.props.onScroll({ currentTarget: historyNode })
+  view = {
+    ...view,
+    turns: [...view.turns, { id: 'turn-2', userText: 'next', assistantText: '', complete: false }]
+  }
+  listener(view)
+  page = renderer.render()
+  historyNode.scrollHeight = 500
+  raf.flush()
+  assert.equal(historyNode.scrollTop, 500)
+
+  view = {
+    ...view,
+    turns: [view.turns[0], { ...view.turns[1], assistantText: 'Streaming answer' }]
+  }
+  listener(view)
+  page = renderer.render()
+  historyNode.scrollHeight = 540
+  raf.flush()
+
+  assert.equal(historyNode.scrollTop, 540)
+  renderer.unmount()
+})
+
+test('a late update to an older turn does not scroll unpinned history', () => {
+  const renderer = createHookRenderer()
+  const raf = createRafHarness()
+  let listener = null
+  let view = {
+    state: 'thinking', active: true, muted: false, busy: false, serverBusy: false,
+    bargeIn: false, silenceMs: 4_000, microphoneLevel: 0,
+    turns: [
+      { id: 'turn-1', userText: 'audio', assistantText: 'First answer', complete: true },
+      { id: 'turn-2', userText: 'next', assistantText: 'Draft', complete: false }
+    ],
+    metrics: {}, systemPrompt: '', errorMessage: '',
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const runtime = {
+    snapshot: () => view,
+    subscribe(callback) { listener = callback; return () => { listener = null } },
+    startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {}, interrupt() {},
+    end() {}, setSilenceMs() {}, setBargeIn() {}
+  }
+  const { testApi } = loadPlugin({
+    react: renderer.react,
+    requestAnimationFrame: callback => raf.requestAnimationFrame(callback),
+    cancelAnimationFrame: id => raf.cancelAnimationFrame(id)
+  })
+
+  let page = renderer.render(testApi.EnglishCoachPage, { runtime })
+  const history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  const historyNode = { scrollTop: 90, scrollHeight: 430, clientHeight: 100 }
+  history.props.ref.current = historyNode
+  history.props.onScroll({ currentTarget: historyNode })
+  view = {
+    ...view,
+    turns: [{ ...view.turns[0], userText: 'late transcript' }, view.turns[1]]
+  }
+  listener(view)
+  page = renderer.render()
+  historyNode.scrollHeight = 450
+  raf.flush()
+
+  assert.equal(historyNode.scrollTop, 90)
+  assert.equal(raf.pending(), 0)
+  renderer.unmount()
+})
+
+test('reconciling the latest turn id does not re-arm unpinned history', () => {
+  const renderer = createHookRenderer()
+  const raf = createRafHarness()
+  let listener = null
+  let view = {
+    state: 'thinking', active: true, muted: false, busy: false, serverBusy: false,
+    bargeIn: false, silenceMs: 4_000, microphoneLevel: 0,
+    turns: [{ id: 'local-1', userText: 'audio', assistantText: '', complete: false }],
+    metrics: {}, systemPrompt: '', errorMessage: '',
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const runtime = {
+    snapshot: () => view,
+    subscribe(callback) { listener = callback; return () => { listener = null } },
+    startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {}, interrupt() {},
+    end() {}, setSilenceMs() {}, setBargeIn() {}
+  }
+  const { testApi } = loadPlugin({
+    react: renderer.react,
+    requestAnimationFrame: callback => raf.requestAnimationFrame(callback),
+    cancelAnimationFrame: id => raf.cancelAnimationFrame(id)
+  })
+
+  let page = renderer.render(testApi.EnglishCoachPage, { runtime })
+  const history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  const historyNode = { scrollTop: 75, scrollHeight: 400, clientHeight: 100 }
+  history.props.ref.current = historyNode
+  history.props.onScroll({ currentTarget: historyNode })
+  view = { ...view, turns: [{ ...view.turns[0], id: 'turn-1' }] }
+  listener(view)
+  page = renderer.render()
+  historyNode.scrollHeight = 420
+  raf.flush()
+
+  assert.equal(historyNode.scrollTop, 75)
+  assert.equal(raf.pending(), 0)
+  renderer.unmount()
+})
+
+test('unmount cancels owned history animation frames and subscription', () => {
+  const renderer = createHookRenderer()
+  const raf = createRafHarness()
+  let listener = null
+  let view = {
+    state: 'thinking', active: true, muted: false, busy: false, serverBusy: false,
+    bargeIn: false, silenceMs: 4_000, microphoneLevel: 0,
+    turns: [{ id: 'turn-1', userText: 'hello', assistantText: 'Draft', complete: false }],
+    metrics: {}, systemPrompt: '', errorMessage: '',
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const runtime = {
+    snapshot: () => view,
+    subscribe(callback) { listener = callback; return () => { listener = null } },
+    startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {}, interrupt() {},
+    end() {}, setSilenceMs() {}, setBargeIn() {}
+  }
+  const { testApi } = loadPlugin({
+    react: renderer.react,
+    requestAnimationFrame: callback => raf.requestAnimationFrame(callback),
+    cancelAnimationFrame: id => raf.cancelAnimationFrame(id)
+  })
+
+  let page = renderer.render(testApi.EnglishCoachPage, { runtime })
+  const history = descendants(page).find(element => element.props?.['aria-label'] === 'Conversation history')
+  const historyNode = { scrollTop: 200, scrollHeight: 300, clientHeight: 100 }
+  history.props.ref.current = historyNode
+  view = {
+    ...view,
+    turns: [{ ...view.turns[0], assistantText: 'A longer draft' }]
+  }
+  listener(view)
+  page = renderer.render()
+  historyNode.scrollHeight = 380
+
+  assert.equal(raf.pending(), 1)
+  renderer.unmount()
+  assert.equal(raf.pending(), 0)
+  assert.equal(listener, null)
+  raf.flush()
+  assert.equal(historyNode.scrollTop, 200)
+})
+
 test('utterance accumulator caps at 60-second capacity without dropping its beginning', () => {
   const { testApi } = loadPlugin()
   const capture = testApi.createCaptureAccumulator(5)
@@ -781,10 +1553,12 @@ test('voice runtime owns exact REST, interruption, event, fallback, and cleanup 
   const log = []
   let eventHandler = null
   let pollCallback = null
+  let onFrame = null
   let captureCleanups = 0
   const rest = async (path, options) => {
     log.push({ kind: 'rest', path, options })
     if (path === '/status') return { state: 'listening', session_id: 's1', generation: 1, turn_id: null, metrics: {} }
+    if (path === '/turn') return { state: 'thinking', session_id: 's1', generation: 1, turn_id: 'turn-1', metrics: {} }
     return { state: path === '/session/stop' ? 'shell_ready' : 'listening', session_id: 's1', generation: 1, turn_id: null, metrics: {} }
   }
   const playback = {
@@ -799,6 +1573,7 @@ test('voice runtime owns exact REST, interruption, event, fallback, and cleanup 
     storage: { get: (_key, fallback) => fallback, set: (key, value) => log.push({ kind: 'storage', key, value }) },
     captureFactory: async options => {
       log.push({ kind: 'capture', constraints: options.constraints })
+      onFrame = options.onFrame
       return { cleanup: async () => { captureCleanups += 1 } }
     },
     playbackFactory: () => playback,
@@ -823,11 +1598,13 @@ test('voice runtime owns exact REST, interruption, event, fallback, and cleanup 
     audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
   })
 
-  eventHandler({ type: 'audio.delta', audio: 'AAAAAA==', sample_rate: 16_000, session_id: 's1', generation: 1 })
+  onFrame(new Float32Array(160).fill(0.2), 0.2)
+  await runtime.manualDone()
+  eventHandler({ type: 'audio.delta', turn_id: 'turn-1', audio: 'AAAAAA==', sample_rate: 16_000, session_id: 's1', generation: 1 })
   assert.equal(playback.enqueued.length, 1)
   assert.equal(playback.enqueued[0][1], 16_000)
-  eventHandler({ type: 'text.delta', text: 'Hello', session_id: 's1', generation: 1 })
-  eventHandler({ type: 'response.done', text: 'Hello', session_id: 's1', generation: 1 })
+  eventHandler({ type: 'text.delta', turn_id: 'turn-1', text: 'Hello', session_id: 's1', generation: 1 })
+  eventHandler({ type: 'response.done', turn_id: 'turn-1', text: 'Hello', session_id: 's1', generation: 1 })
   assert.equal(runtime.snapshot().assistantText, 'Hello')
   assert.equal(runtime.snapshot().state, 'listening')
 
@@ -850,21 +1627,26 @@ test('response completion waits for delayed local playback drain before listenin
   const { testApi } = loadPlugin()
   const context = new FakeAudioContext()
   let eventHandler = null
+  let onFrame = null
+  let turnNumber = 0
   const runtime = testApi.createVoiceRuntime({
     rest: async path => ({
       state: path === '/session/stop' ? 'shell_ready' : 'listening',
       session_id: path === '/session/stop' ? null : 's1',
-      generation: 1
+      generation: 1,
+      turn_id: path === '/turn' ? `turn-${++turnNumber}` : null
     }),
     storage: { get: (_key, fallback) => fallback, set() {} },
-    captureFactory: async () => ({ cleanup: async () => {} }),
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
     playbackFactory: async () => testApi.createPlaybackQueue(context)
   })
   runtime.bindSocket((_path, handler) => { eventHandler = handler; return () => {} })
   await runtime.start('')
 
-  eventHandler({ type: 'audio.delta', audio: 'AAAAAA==', sample_rate: 16_000, session_id: 's1', generation: 1 })
-  eventHandler({ type: 'response.done', text: 'complete upstream', session_id: 's1', generation: 1 })
+  onFrame(new Float32Array(160).fill(0.2), 0.2)
+  await runtime.manualDone()
+  eventHandler({ type: 'audio.delta', turn_id: 'turn-1', audio: 'AAAAAA==', sample_rate: 16_000, session_id: 's1', generation: 1 })
+  eventHandler({ type: 'response.done', turn_id: 'turn-1', text: 'complete upstream', session_id: 's1', generation: 1 })
 
   assert.equal(runtime.snapshot().state, 'speaking')
   assert.equal(context.sources.length, 1)
@@ -874,8 +1656,10 @@ test('response completion waits for delayed local playback drain before listenin
   await until(() => runtime.snapshot().state === 'listening')
   assert.equal(runtime.snapshot().playback.sourceCount, 0)
 
-  eventHandler({ type: 'audio.delta', audio: 'AAAAAA==', sample_rate: 16_000, session_id: 's1', generation: 1 })
-  eventHandler({ type: 'response.done', text: 'interrupt locally', session_id: 's1', generation: 1 })
+  onFrame(new Float32Array(160).fill(0.2), 0.2)
+  await runtime.manualDone()
+  eventHandler({ type: 'audio.delta', turn_id: 'turn-2', audio: 'AAAAAA==', sample_rate: 16_000, session_id: 's1', generation: 1 })
+  eventHandler({ type: 'response.done', turn_id: 'turn-2', text: 'interrupt locally', session_id: 's1', generation: 1 })
   assert.equal(runtime.snapshot().state, 'speaking')
   await runtime.interrupt()
   assert.equal(context.sources[1].stopped, 1)
@@ -1241,6 +2025,80 @@ test('current-generation polling surfaces backend error after the backend clears
   await runtime.dispose()
 })
 
+test('End and Interrupt during a pending submit terminalize its bubble and preserve partial text', async t => {
+  for (const action of ['end', 'interrupt']) {
+    await t.test(action, async () => {
+      const { testApi } = loadPlugin()
+      const turnResponse = deferred()
+      let eventHandler = null
+      let onFrame = null
+      let starts = 0
+      const runtime = testApi.createVoiceRuntime({
+        rest: async path => {
+          if (path === '/session/start') {
+            starts += 1
+            return { state: 'listening', session_id: `s${starts}`, generation: starts }
+          }
+          if (path === '/turn') return turnResponse.promise
+          return { state: 'shell_ready', session_id: null, generation: starts + 1 }
+        },
+        storage: { get: (_key, fallback) => fallback, set() {} },
+        captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+        playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+      })
+      runtime.bindSocket((_path, handler) => { eventHandler = handler; return () => {} })
+      await runtime.start('')
+      onFrame(new Float32Array(1_600).fill(0.2), 0.2)
+
+      const submitting = runtime.manualDone()
+      await until(() => runtime.snapshot().turns.length === 1)
+      eventHandler({ type: 'turn.started', turn_id: 'turn-1', session_id: 's1', generation: 1 })
+      if (action === 'interrupt') {
+        eventHandler({ type: 'text.delta', turn_id: 'turn-1', text: 'Partial answer', session_id: 's1', generation: 1 })
+      }
+      const cancelling = runtime[action]()
+      await until(() => runtime.snapshot().turns[0].complete, `${action} did not terminalize the pending turn`)
+      assert.equal(
+        runtime.snapshot().turns[0].assistantText,
+        action === 'interrupt' ? 'Partial answer' : 'Turn interrupted.'
+      )
+      turnResponse.resolve({ state: 'thinking', session_id: 's1', generation: 1, turn_id: 'turn-1' })
+      await Promise.all([submitting, cancelling])
+
+      const turn = runtime.snapshot().turns[0]
+      assert.equal(turn.complete, true)
+      assert.equal(turn.assistantText, action === 'interrupt' ? 'Partial answer' : 'Turn interrupted.')
+      if (action === 'interrupt') await runtime.end()
+      await runtime.dispose()
+    })
+  }
+})
+
+test('End terminalizes a pending turn after its submission was accepted', async () => {
+  const { testApi } = loadPlugin()
+  let onFrame = null
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/session/start') return { state: 'listening', session_id: 's1', generation: 1 }
+      if (path === '/turn') return { state: 'thinking', session_id: 's1', generation: 1, turn_id: 'turn-1' }
+      return { state: 'shell_ready', session_id: null, generation: 2 }
+    },
+    storage: { get: (_key, fallback) => fallback, set() {} },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+  await runtime.start('')
+  onFrame(new Float32Array(1_600).fill(0.2), 0.2)
+  await runtime.manualDone()
+  assert.equal(runtime.snapshot().turns[0].complete, false)
+
+  await runtime.end()
+
+  assert.equal(runtime.snapshot().turns[0].complete, true)
+  assert.equal(runtime.snapshot().turns[0].assistantText, 'Turn interrupted.')
+  await runtime.dispose()
+})
+
 test('turn failure transitions to error only after releasing session resources', async () => {
   const { testApi } = loadPlugin()
   let onFrame = null
@@ -1275,6 +2133,9 @@ test('turn failure transitions to error only after releasing session resources',
   assert.equal(captureCleanups, 1)
   assert.equal(playbackCleanups, 1)
   assert.equal(stopCalls, 1)
+  assert.equal(runtime.snapshot().turns.length, 1)
+  assert.equal(runtime.snapshot().turns[0].complete, true)
+  assert.equal(runtime.snapshot().turns[0].assistantText, 'Turn failed.')
 })
 
 test('server polling runs every three seconds without a voice session and isolates failures', async () => {
