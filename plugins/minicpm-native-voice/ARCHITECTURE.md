@@ -7,6 +7,12 @@ concurrent, display-only STT side path labels the user's turn bubble; it never
 gates, alters, or replaces MiniCPM-o input. There is no strict full-duplex
 scheduler.
 
+The optional Smart mode is a serialized three-stage pipeline in the same page:
+request-owned MiniCPM audio understanding, the current or explicitly saved Hermes text-model route,
+then exact-text MiniCPM native speech. Native remains the persisted default.
+Smart has no separate transcription stage, alternate voice path, hidden input
+instructions, or persistent Native WebSocket session.
+
 ## Component boundaries
 
 | Component | Owns | Does not own |
@@ -16,6 +22,19 @@ scheduler.
 | Local Server manager | Strict local configuration, exact child argv/environment, port conflict detection, health/init waits, ownership-safe stop | Arbitrary command input, external process adoption, persistent process recovery |
 | Companion `llama-omni-server` | Native-audio WebSocket protocol, MiniCPM-o decode, Token2Wav, HiFiGAN, session close, health/init endpoints | Hermes authentication, Desktop UI, prompt persistence |
 | Model directory | Main GGUF and the published audio, TTS, and Token2Wav/HiFiGAN files required by the audio-only `media_type=1` profile; optional vision companion file for separately verified vision use | Plugin code or configuration |
+
+Smart mode additionally owns only bounded Smart history and request-scoped
+MiniCPM connections. The separately built Omni candidate owns its audio-task
+and exact-text speech implementations; no Server implementation is copied into
+the plugin.
+
+The page-local **Controls** accordion owns visibility only. It mounts collapsed
+and wraps the mode switch, nested Server and Prompts sections, Smart model
+picker, action buttons, VAD settings, and barge-in setting. The header/status,
+microphone meter, conversation history, timing, and error remain outside it.
+Its state is neither persisted nor part of the voice runtime snapshot, so
+expanding or hiding it cannot mutate session, model, prompt, Server, or runtime
+state. The nested Server and Prompts accordions keep their independent behavior.
 
 ## End-to-end lifecycle
 
@@ -33,9 +52,12 @@ scheduler.
 4. After `session.created`, the backend publishes `ready`, then `listening`.
    Desktop acquires one mono microphone stream and resamples frames to 16 kHz.
 5. Before speech, capture retains only the latest 500 ms as pre-roll. Speech
-   onset starts the 60-second/960,000-sample allowance; VAD ends the utterance
-   after the selected silence interval or that post-onset cap. **I'm done**
-   requests the same submission explicitly.
+   onset at the current persisted threshold starts the 60-second/960,000-sample
+   allowance; VAD ends the utterance after the selected silence interval or
+   that post-onset cap. **I'm done** requests the same submission explicitly.
+   **Discard utterance** synchronously advances an utterance-generation token
+   and clears only unsent VAD, accumulator, pre-roll, and capture state, making
+   an already-queued auto/manual submit stale without touching the session.
 6. Desktop uploads `turn.f32le.pcm` as multipart field `file`. FastAPI/Starlette
    parses it into a spooled `UploadFile` before the route runs, so the framework
    may use operating-system temporary-file storage. The route then performs its
@@ -63,6 +85,52 @@ IDs to ignore late reader events, poll completions, socket traffic, and display
 transcripts from the wrong owner. Desktop has a separate serialized lifecycle
 lane and cancellation epoch for the same purpose.
 
+### Smart lifecycle
+
+1. Desktop loads the authenticated central provider/model inventory through
+   `GET /smart/models`. It stores only an explicitly saved provider/model pair;
+   empty identifiers mean the current Hermes model. `POST /smart/session/start`
+   revalidates a nonempty pair against a fresh sanitized inventory snapshot and
+   freezes it with the exact optional model prompt and required MiniCPM input
+   prompt. The backend starts the Server only if needed, records exact process
+   ownership, and creates no WebSocket.
+2. Each `/smart/turn` validates bounded Float32LE 16 kHz PCM, creates a fresh
+   turn-based MiniCPM input session with an empty system prompt, places the
+   exact user input instructions after the audio, disables input-stage speech,
+   and requires a text-only completion.
+3. The input session closes before the backend calls the frozen Hermes
+   text-model route through the host `PluginLlm` facade with the optional exact
+   system prompt, bounded complete prior Smart pairs, and the current MiniCPM
+   interpretation. Exact case-sensitive `<unk>` placeholders are removed from
+   final and streamed interpretations before publication; SOA/EOA/NUL/dataset
+   wrappers remain hard failures. The host supplies central authentication and
+   Base URL resolution; the plugin selects no auxiliary slot or fallback pool
+   and never receives credentials.
+4. The exact assistant text is posted to the fixed loopback native-speech
+   endpoint. Its exact `text`/`audio`/`sample_rate` response is validated, then
+   `audio` is normalized to the session/frontend `audio_base64` field. Valid 24
+   kHz Float32LE audio enters the existing playback queue at the Smart speed
+   frozen when the turn was submitted. Web Audio `playbackRate` changes pitch
+   slightly; no DSP or time-stretch dependency is present. Scheduled duration
+   and queue budgets use PCM duration divided by that rate while PCM bytes and
+   the full-buffer offset remain unchanged. A speech-stage
+   failure commits the pair once and returns text with an explicit bounded
+   warning.
+5. A request failure terminalizes only its pending turn, best-effort calls
+   `/smart/session/interrupt`, clears unsent capture/playback, and returns the
+   still-current session to listening without releasing its Server. Invalid
+   session/generation identity remains fatal. Explicit Interrupt invalidates
+   and cancels only the active turn. Stop invalidates the
+   session, clears backend Smart history, and stops only a Server this session
+   started. Session, turn, and generation checks reject every late completion.
+
+Explicit selection requires plugin-scoped Hermes LLM trust with
+`allow_provider_override: true`, `allow_model_override: true`,
+`allowed_providers: ["*"]`, and `allowed_models: ["*"]`. This is safe because
+the REST pair is validated against the central authenticated inventory at Start;
+the host still owns auth and routing. Deployment configuration is intentionally
+outside this repository task.
+
 ## Source map and symptom routing
 
 Every production, configuration, and test file in the package is listed here.
@@ -83,6 +151,7 @@ Every production, configuration, and test file in the package is listed here.
 | `tests/test_bridge_state.py` | Event count/byte overflow, WebSocket bounds, session conflicts, stale-event rejection, ordered forwarding, cleanup, loopback fake Server | Concurrency, state, event ordering, or cleanup regresses |
 | `tests/test_api_routes.py` | ASGI route status/error mapping, public snapshots, lifecycle order | HTTP status or route contract changes |
 | `tests/test_server_manager.py` | Five-field config, exact argv/env/init payload, port conflict, startup/timeout/stop ownership, public-data redaction | Managed Server controls or process safety changes |
+| `tests/test_smart_session.py` | Smart prompts, exact three-stage payloads, history, failure short-circuiting, stale ownership, strict REST, and production static gates | Smart mode routing, privacy, cancellation, or response validation changes |
 | `tests/plugin.test.cjs` | Desktop transforms, VAD, playback, prompt storage, registration/UI, lifecycle races, polling, Server buttons, browser cleanup | Any Desktop or Web Audio behavior changes |
 | `.github/workflows/minicpm-native-voice.yml` | Path-scoped clean Windows/Ubuntu Python 3.12 and Node 20/22 checks | CI environment or documented test commands drift |
 
@@ -114,6 +183,11 @@ unauthenticated bypass.
 | `POST /session/start` | JSON `system_prompt` string of at most 65,536 UTF-8 bytes; optional strict integer `port` | Creates one audio-only, TTS-enabled upstream session; over-limit prompts and extra JSON fields are rejected |
 | `POST /turn` | multipart field `file`, required `application/octet-stream`, native PCM | Accepts one turn only when a session exists and no turn is active |
 | `POST /session/stop` | empty JSON | Idempotently cancels the reader, requests upstream close, closes the socket, and clears state |
+| `GET /smart/models` | optional boolean `refresh=false`; no other or repeated query fields | Returns only bounded provider labels and model identifiers from central authenticated inventory; explicit refresh may refresh catalogs and probe saved custom endpoints |
+| `POST /smart/session/start` | exact JSON `gpt_system_prompt`, nonblank `minicpm_input_prompt`, and default-empty `model_provider`/`model_name`; prompts are each at most 65,536 UTF-8 bytes and a nonempty model pair must match the current catalog | Freezes prompts/model pair, starts/reuses the Server without creating a persistent WebSocket, and creates an opaque Smart session |
+| `POST /smart/turn` | exactly one multipart `file` with `application/octet-stream` bounded Float32LE 16 kHz PCM | Returns one bounded interpretation/assistant pair plus optional validated 24 kHz Float32LE Base64 audio |
+| `POST /smart/session/interrupt` | exact empty JSON | Cancels the owned turn, preserves Smart history/session, and returns to listening |
+| `POST /smart/session/stop` | exact empty JSON | Releases the turn/session and stops only the Server owned by that Smart session |
 | `WS /events` | authenticated upgrade | Initial `status`, then ordered `state`, `turn.started`, `text.delta`, `audio.delta`, `user.transcript`, `response.done`, or `error` objects |
 
 HTTP error mapping is deliberate: malformed requests/config are `400`, a
@@ -228,10 +302,10 @@ and incoming queue depth is eight.
 | Child execution | Exact argv list, `shell=False`, no stdin, combined configured log, hidden/new process group on Windows |
 | Upload | FastAPI/Starlette multipart parsing occurs before the handler and may spool to OS temporary-file storage; the route then reads at most 5,242,881 bytes, accepts at most 5,242,880 positive/aligned bytes, and closes the `UploadFile` on success or rejection |
 | Capture | 16 kHz mono Float32; at most 500 ms/8,000 samples of pre-roll plus 60 seconds/960,000 samples from speech onset; earlier initial silence is discarded |
-| VAD | Threshold `0.02`; end silence defaults to 4,000 ms and clamps to 2,000-6,000 ms |
+| VAD | Persisted `voiceTriggerThreshold` defaults to `0.040`, clamps to `0.005`-`0.100` in `0.005` UI steps, and atomically discards unsent capture before a change; end silence defaults to 4,000 ms and clamps to 2,000-6,000 ms |
 | Experimental barge-in | Off by default; 300 ms sustained speech and 500 ms bounded pre-roll |
 | Per-subscriber queue | 64 events and 12 MiB serialized bytes; overflow clears pending items, emits one explicit error, then rejects later items for that subscriber |
-| Text | 8 KiB UTF-8 per delta, 64 KiB current-turn total; truncation preserves valid UTF-8 |
+| Text | 8 KiB UTF-8 per delta, 64 KiB current-turn total; truncation preserves valid UTF-8; exact MiniCPM `<unk>` placeholders are withheld/removed without rewriting other interpretation text |
 | Display-only STT | Validated input is converted in a worker to a mono 16 kHz PCM16 temporary WAV; configured Hermes STT is tried first, then only the already-installed local fallback; the plugin never configures cloud access, installs a package, or downloads a model; text is 64 KiB UTF-8 maximum and failures are silent |
 | Desktop history | Session-local only; at most 100 turns, 64 KiB UTF-8 per user/assistant field, and 1 MiB across all combined field text; oldest completed turns are evicted first, the active pending turn is never dropped or mutated to fit history, completed assistant text/audio are frozen, and late display STT may update the matching user field; cleared by runtime recreation, not response/session completion |
 | User-owned prompt | Exact empty/whitespace semantics; maximum 65,536 UTF-8 bytes at Desktop storage/start and backend API; over-limit values are rejected without trimming, truncation, or normalization |
@@ -240,7 +314,7 @@ and incoming queue depth is eight.
 | Sample rate | Positive upstream integer; missing/invalid value falls back to 24,000 Hz |
 | Metrics | At most 32 string keys; keys at most 64 characters; numeric/boolean values only |
 | Public errors/status | Messages bounded; Server status omits config paths, argv, environment, prompt, and logs |
-| Persistence | Plugin storage contains only the prompt and two preferences; turn history is memory-only. Multipart parsing and display STT use OS temporary storage, and the companion Server may write under its configured output/log paths; none is a never-disk boundary |
+| Persistence | Plugin storage contains the two user-owned prompts plus interaction mode, silence, voice-trigger, and barge-in preferences; prompt expansion and turn history are memory-only. Multipart parsing and display STT use OS temporary storage, and the companion Server may write under its configured output/log paths; none is a never-disk boundary |
 | Cleanup | Tracks, nodes, sources, contexts, timers, subscribers, STT tasks/WAVs, clients, sockets, and `UploadFile`/spooled temporary files are released by their owning lifecycle; owned child/log state is released only after exit is confirmed and otherwise remains owned for a safe retry; host temp-file remanence and external Server output retention remain subject to local policy |
 
 Do not expose port `9060` beyond loopback, add an arbitrary upstream URL, pass

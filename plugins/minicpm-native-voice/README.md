@@ -2,9 +2,10 @@
 
 `minicpm-native-voice` is one unified Hermes plugin package: an **English
 Coach** page in Hermes Desktop plus an authenticated dashboard/backend bridge
-to a local `llama-omni-server`. V2 sends microphone samples to MiniCPM-o as
-native audio, shows a concurrent display-only transcript in persistent turn
-bubbles, and plays native audio returned by Token2Wav and HiFiGAN.
+to a local `llama-omni-server`. Native mode remains the persisted default and
+keeps the V2 behavior: it sends microphone samples to MiniCPM-o as native
+audio, shows a concurrent display-only transcript in persistent turn bubbles,
+and plays native audio returned by Token2Wav and HiFiGAN.
 
 This is **native audio, turn-based streaming V2**. STT is display-only: it never
 gates, alters, or replaces raw audio sent to MiniCPM-o. This is not an STT/text
@@ -14,6 +15,95 @@ barge-in is available but is off by default.
 Display STT tries the user's already-configured Hermes transcription provider,
 then an already-installed local fallback. The plugin does not configure a cloud
 provider, install an STT package, or download a transcription model.
+
+## Experimental Smart mode
+
+Windows users may opt into the experimental `smart-minicpm` mode. It uses this
+exact turn pipeline:
+
+```text
+raw Float32LE 16 kHz microphone PCM
+  -> MiniCPM-o native audio understanding with the user's visible input prompt
+  -> the current or explicitly saved Hermes text-model route with the user's optional model prompt
+  -> exact assistant text
+  -> MiniCPM teacher-forced native speech at 24 kHz
+  -> the existing history and playback queue
+```
+
+Smart mode has two separate user-owned prompt fields. Both default to empty;
+Smart Start requires nonblank MiniCPM input-understanding instructions, while
+the model prompt remains optional. The plugin supplies no hidden input prompt,
+dictionary, coach persona, memory, skills, tools, or fabricated transcript.
+All configuration and action UI mounts collapsed behind the page-local
+**Controls** row. Its compact row shows the current interaction mode and a
+**Details** button; expansion changes the button to **Hide**. The Server and
+Prompts sections retain their own nested details controls. None of these
+expansion states are persisted or alter session, model, prompt, Server, or
+runtime state.
+The middle stage uses the Hermes host `PluginLlm` facade with central Hermes
+authentication; the plugin selects no auxiliary slot or fallback pool. **Smart
+model** defaults to the current Hermes model. An optional saved provider/model
+pair is chosen only from the authenticated central inventory and is frozen when
+Smart Start succeeds. The Coach stores only those two identifiers and never
+receives, returns, logs, or stores API keys, OAuth data, or Base URLs.
+There is no separate transcription stage and no alternate voice fallback in
+the Smart production path. If native speech generation fails after reasoning,
+the exact assistant text remains visible and no substitute audio plays.
+Smart native audio plays at `1.0x`, preserving the pitch, speed, and timing of
+the generated PCM.
+
+Smart Start loads the configured Server on demand and stops it at End only when
+that Smart session started it. An already-running managed or external Server is
+never adopted. The input WebSocket is request-owned and closes before text
+reasoning and native speech begin. Smart Interrupt cancels only the current
+turn and keeps the session listening; Smart mode is turn-based and not full
+duplex. A failed Smart input/reasoning request is terminalized as one failed
+turn, best-effort interrupted on the backend, and returns the same session to
+listening; invalid session/generation identities still fail closed. Exact
+case-sensitive MiniCPM `<unk>` placeholders are removed from the
+interpretation before partial display, Hermes reasoning, history, or the final
+event; other text and hard-rejected model-audio wrappers keep their existing
+semantics.
+
+The companion Omni candidate is a separately built runtime dependency. Its
+audio-task and exact-text speech endpoints are required, but its source is not
+embedded or duplicated in this plugin.
+
+The exact MiniCPM native-speech response is JSON with only `text`, `audio`
+(Base64 Float32LE), and `sample_rate` fields. After strict validation, the
+plugin normalizes `audio` to `audio_base64` only in its session/frontend
+response.
+
+Privacy, network, cost, and latency depend on the configured Hermes text-model
+route: the MiniCPM audio stages remain fixed to loopback, while the middle text
+request may leave the machine, incur provider charges, and add model latency.
+Cold local Server startup commonly adds 15–30 seconds. Review the selected
+Hermes provider before enabling Smart mode and do not use sensitive prompts or
+audio unless that provider is appropriate.
+
+Automated Smart tests use injected dependencies and synthetic PCM. Packaged
+GUI, microphone, listening-quality, and real-chain acceptance are **NOT RUN**
+in this source change and must be recorded separately on Windows.
+
+Deployments that use explicit Smart provider/model selection must configure this
+plugin-scoped Hermes LLM trust block (do not add credentials to the plugin):
+
+```yaml
+plugins:
+  entries:
+    minicpm-native-voice:
+      llm:
+        allow_provider_override: true
+        allow_model_override: true
+        allowed_providers: ["*"]
+        allowed_models: ["*"]
+```
+
+The wildcard allowlists are safe here because every REST selection is validated
+against the central authenticated inventory immediately before session Start;
+central Hermes remains responsible for routing and auth resolution. A missing
+trust block remains fail-closed. This repository task does not modify deployment
+configuration.
 
 For implementation ownership, protocol details, and symptom-to-source routing,
 see [ARCHITECTURE.md](ARCHITECTURE.md). For release checks, upgrades, recovery,
@@ -246,16 +336,22 @@ model-facing contract and must be treated as a product change.
 
 ## Normal operation
 
-1. Open **English Coach**. The Server card updates every three seconds.
-2. Select **Start Server** for a configured, stopped Server, or start a
+1. Open **English Coach**. The Server status updates every three seconds.
+2. Expand **Controls**, expand **Server** with **Details**, and select **Start
+   Server** for a configured, stopped Server, or start a
    contract-compatible Server yourself on `127.0.0.1:9060`.
 3. Wait for `ready` (managed) or `external` (self-managed).
-4. Enter an optional prompt. Empty is valid and means exactly empty.
+4. Expand **Prompts** with **Details** and enter an optional prompt. Empty is
+   valid and means exactly empty. The Controls and Prompts accordions collapse
+   again on route remount.
 5. Select **Start** and grant microphone permission.
 6. Speak. V2 retains at most 500 ms of pre-roll, starts the 60-second utterance
-   allowance when speech begins, and submits after the configured 2,000-6,000
-   ms silence window; select **I'm done** to submit sooner. Earlier initial
-   silence is discarded. The right-side bubble first shows the native-audio
+   allowance when the microphone level reaches the persisted voice-trigger
+   threshold (default `0.040`, range `0.005`-`0.100`), and submits after the
+   configured 2,000-6,000 ms silence window; select **I'm done** to submit
+   sooner. Select **Discard utterance** while listening to clear only the
+   current unsent capture. Earlier initial silence is discarded. The
+   right-side bubble first shows the native-audio
    duration, then updates in place if display transcription succeeds; prior
    user-right/assistant-left turn pairs remain visible for this runtime. A
    completed turn ignores later text/audio deltas and duplicate completion;
@@ -277,6 +373,7 @@ model-facing contract and must be treated as a product change.
 | Start Server fails | Validate all five `server.local.json` fields, exact Windows executable basename, main `.gguf`, worktree, writable output/log parents, Vulkan driver, companion build, and free port. Inspect only the configured Server log; path details are intentionally absent from the public status response. |
 | Microphone does not start | Check Windows microphone privacy settings, packaged Desktop permission, input device routing, and whether another application owns the device. End the session before retrying. |
 | Microphone meter moves but no turn is sent | Speak above the VAD threshold, wait through the selected silence window, or select **I'm done**. Initial silence beyond the 500 ms pre-roll is intentionally ignored; the 60-second allowance starts at speech onset. |
+| Ambient noise starts a turn | Raise **Voice trigger threshold**. Changing it discards any current unsent utterance before the new threshold applies, so one capture never mixes thresholds. |
 | Prompt is rejected | Encode the exact value as UTF-8 and keep it at or below 65,536 bytes. The plugin never silently trims or truncates an over-limit prompt. |
 | No audio events arrive | Verify a local token-mode Desktop/backend connection, Server `/backend` compatibility, and that `/status` reaches `thinking`/`speaking`. OAuth-remote Desktop sockets are unsupported in V2; polling reports state but cannot carry incremental audio. |
 | User bubble stays at native-audio duration | Display STT is best-effort. Check the configured Hermes STT provider and credentials, then confirm an already-installed local fallback exists. Failure never blocks native MiniCPM input or voice playback. |
@@ -289,7 +386,10 @@ model-facing contract and must be treated as a product change.
 - Installed source and `server.local.json` live under
   `$HERMES_HOME/plugins/minicpm-native-voice`.
 - The prompt and preferences live in Hermes Desktop's plugin-scoped storage:
-  `userOwnedModelPrompt`, `silenceMs`, and `experimentalBargeIn`.
+  `userOwnedModelPrompt`, `minicpmInputUnderstandingPrompt`,
+  `voiceInteractionMode`, `silenceMs`, `voiceTriggerThreshold`, and
+  `experimentalBargeIn`. Prompt-section expansion and turn history are not
+  persisted.
 - Server output and the combined stdout/stderr log live only at the two paths
   selected in `server.local.json`.
 - Turn uploads are parsed by FastAPI/Starlette as multipart `UploadFile`

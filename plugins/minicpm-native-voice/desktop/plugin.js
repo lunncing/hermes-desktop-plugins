@@ -21,6 +21,10 @@ const PRE_ROLL_SAMPLES = TARGET_SAMPLE_RATE / 2
 const DEFAULT_SILENCE_MS = 4_000
 const MIN_SILENCE_MS = 2_000
 const MAX_SILENCE_MS = 6_000
+const DEFAULT_NOISE_THRESHOLD = 0.04
+const MIN_NOISE_THRESHOLD = 0.005
+const MAX_NOISE_THRESHOLD = 0.1
+const NOISE_THRESHOLD_STEP = 0.005
 const FALLBACK_PLAYBACK_RATE = 24_000
 const MAX_PLAYBACK_SECONDS = 75
 const DEFAULT_FIRST_SOURCE_LEAD_SECONDS = 0.03
@@ -33,10 +37,24 @@ const SERVER_POLL_TIMEOUT_MS = 5_000
 const MAX_SYSTEM_PROMPT_BYTES = 65_536
 const MAX_TURNS = 100
 const TURN_TEXT_MAX_BYTES = 65_536
+const TURN_ID_MAX_BYTES = 256
 const HISTORY_TEXT_MAX_BYTES = 1024 * 1024
 const HISTORY_BOTTOM_THRESHOLD_PX = 48
 const SYSTEM_PROMPT_LIMIT_ERROR = 'System prompt exceeds the maximum of 65,536 UTF-8 bytes.'
 const USER_OWNED_MODEL_PROMPT_KEY = 'userOwnedModelPrompt'
+const VOICE_INTERACTION_MODE_KEY = 'voiceInteractionMode'
+const MINICPM_INPUT_PROMPT_KEY = 'minicpmInputUnderstandingPrompt'
+const VOICE_TRIGGER_THRESHOLD_KEY = 'voiceTriggerThreshold'
+const SMART_MODEL_PROVIDER_KEY = 'smartModelProvider'
+const SMART_MODEL_NAME_KEY = 'smartModelName'
+const MAX_SMART_MODEL_PROVIDERS = 64
+const MAX_SMART_MODELS_PER_PROVIDER = 500
+const MAX_SMART_PROVIDER_BYTES = 128
+const MAX_SMART_MODEL_BYTES = 512
+const MAX_SMART_PROVIDER_LABEL_BYTES = 256
+const NATIVE_MODE = 'native'
+const SMART_MODE = 'smart-minicpm'
+const SMART_INPUT_REQUIRED_ERROR = 'MiniCPM input instructions are required for Smart mode.'
 
 function utf8ByteLength(value) {
   let bytes = 0
@@ -149,7 +167,7 @@ export function decodeAudioBase64(encoded, { maxDecodedBytes = MAX_AUDIO_DELTA_B
   return bytesToFloat32(bytes)
 }
 
-export function createVad({ silenceMs = DEFAULT_SILENCE_MS, maxMs = 60_000, threshold = 0.02 } = {}) {
+export function createVad({ silenceMs = DEFAULT_SILENCE_MS, maxMs = 60_000, threshold = DEFAULT_NOISE_THRESHOLD } = {}) {
   if (silenceMs < MIN_SILENCE_MS || silenceMs > MAX_SILENCE_MS) throw new RangeError('silenceMs out of bounds')
   let speechStarted = false
   let quietMs = 0
@@ -246,11 +264,14 @@ export function createPlaybackQueue(audioContext, {
     firstSourceLeadSeconds > MAX_FIRST_SOURCE_LEAD_SECONDS
   ) throw new RangeError('invalid playback lead-in')
   const sources = new Set()
+  const warmupResolvers = new Map()
   const drainWaiters = new Set()
   let nextTime = audioContext.currentTime
   let queuedSeconds = 0
   let queuedBytes = 0
   let droppedChunks = 0
+  let warmupCount = 0
+  let lastSpeechSamples = 0
 
   const resolveDrainWaiters = () => {
     if (sources.size) return
@@ -260,6 +281,46 @@ export function createPlaybackQueue(audioContext, {
   }
 
   return {
+    async warmup(sampleRate, seconds = 0.5) {
+      if (!Number.isInteger(sampleRate) || sampleRate <= 0) {
+        throw new RangeError('invalid warmup sample rate')
+      }
+      if (!Number.isFinite(seconds) || seconds < 0 || seconds > 1) {
+        throw new RangeError('invalid warmup duration')
+      }
+      warmupCount += 1
+      const sampleCount = Math.round(sampleRate * seconds)
+      if (!sampleCount) return
+      const buffer = audioContext.createBuffer(1, sampleCount, sampleRate)
+      const source = audioContext.createBufferSource()
+      await new Promise((resolve, reject) => {
+        let settled = false
+        const finish = () => {
+          if (settled) return
+          settled = true
+          sources.delete(source)
+          warmupResolvers.delete(source)
+          try { source.disconnect() } catch {}
+          resolveDrainWaiters()
+          resolve()
+        }
+        try {
+          source.buffer = buffer
+          source.connect(audioContext.destination)
+          source.onended = finish
+          sources.add(source)
+          warmupResolvers.set(source, finish)
+          source.start(audioContext.currentTime, 0)
+        } catch (error) {
+          sources.delete(source)
+          warmupResolvers.delete(source)
+          try { source.stop() } catch {}
+          try { source.disconnect() } catch {}
+          settled = true
+          reject(error)
+        }
+      })
+    },
     enqueue(samples, sampleRate = FALLBACK_PLAYBACK_RATE) {
       if (!(samples instanceof Float32Array) || !Number.isInteger(sampleRate) || sampleRate <= 0) return false
       const duration = samples.length / sampleRate
@@ -284,10 +345,11 @@ export function createPlaybackQueue(audioContext, {
           try { source.disconnect() } catch {}
           resolveDrainWaiters()
         }
-        source.start(startsAt)
+        source.start(startsAt, 0)
         nextTime = startsAt + duration
         queuedSeconds += duration
         queuedBytes += byteLength
+        lastSpeechSamples = samples.length
         sources.add(source)
         return true
       } catch (error) {
@@ -297,11 +359,14 @@ export function createPlaybackQueue(audioContext, {
       }
     },
     interrupt() {
-      for (const source of sources) {
+      for (const source of [...sources]) {
         try { source.stop() } catch {}
-        try { source.disconnect() } catch {}
+        const finishWarmup = warmupResolvers.get(source)
+        if (finishWarmup) finishWarmup()
+        else try { source.disconnect() } catch {}
       }
       sources.clear()
+      warmupResolvers.clear()
       queuedSeconds = 0
       queuedBytes = 0
       nextTime = audioContext.currentTime
@@ -314,7 +379,8 @@ export function createPlaybackQueue(audioContext, {
     snapshot() {
       return {
         queuedSeconds, queuedBytes, nextTime, sourceCount: sources.size, droppedChunks,
-        maxQueuedSeconds, maxQueuedBytes, firstSourceLeadSeconds
+        maxQueuedSeconds, maxQueuedBytes, firstSourceLeadSeconds,
+        warmupCount, lastSpeechSamples
       }
     }
   }
@@ -360,6 +426,71 @@ export function buildSessionStartRequest(systemPrompt = '') {
   return {
     path: '/session/start',
     options: { method: 'POST', body: { system_prompt: validatedPrompt }, timeoutMs: 130_000 }
+  }
+}
+
+function boundedSmartIdentity(value, maxBytes) {
+  return typeof value === 'string' && value.length && utf8ByteLength(value) <= maxBytes ? value : ''
+}
+
+function normalizeSmartModelsCatalog(value) {
+  if (!value || typeof value !== 'object' || !value.current || !Array.isArray(value.providers)) {
+    throw new Error('Model catalog is unavailable.')
+  }
+  const current = {
+    provider: boundedSmartIdentity(value.current.provider, MAX_SMART_PROVIDER_BYTES),
+    model: boundedSmartIdentity(value.current.model, MAX_SMART_MODEL_BYTES)
+  }
+  const byProvider = new Map()
+  for (const raw of value.providers.slice(0, MAX_SMART_MODEL_PROVIDERS)) {
+    if (!raw || typeof raw !== 'object') continue
+    const provider = boundedSmartIdentity(raw.provider, MAX_SMART_PROVIDER_BYTES)
+    if (!provider || provider.toLowerCase() === 'moa') continue
+    const label = typeof raw.label === 'string' && raw.label
+      ? utf8Prefix(raw.label, MAX_SMART_PROVIDER_LABEL_BYTES)
+      : provider
+    const models = Array.isArray(raw.models)
+      ? [...new Set(raw.models
+        .map(model => boundedSmartIdentity(model, MAX_SMART_MODEL_BYTES))
+        .filter(Boolean))]
+        .sort((left, right) => left.localeCompare(right))
+        .slice(0, MAX_SMART_MODELS_PER_PROVIDER)
+      : []
+    byProvider.set(provider, { provider, label, models })
+  }
+  return {
+    current,
+    providers: [...byProvider.values()].sort((left, right) => (
+      left.label.localeCompare(right.label) || left.provider.localeCompare(right.provider)
+    ))
+  }
+}
+
+function smartModelPairAvailable(catalog, provider, model) {
+  if (!provider && !model) return true
+  if (!provider || !model || !catalog) return false
+  const row = catalog.providers.find(candidate => candidate.provider === provider)
+  return Boolean(row && row.models.includes(model))
+}
+
+export function buildSmartSessionStartRequest(
+  gptSystemPrompt = '', minicpmInputPrompt = '', modelProvider = '', modelName = ''
+) {
+  const validatedGptPrompt = validateSystemPrompt(gptSystemPrompt)
+  const validatedInputPrompt = validateSystemPrompt(minicpmInputPrompt)
+  if (!validatedInputPrompt.trim()) throw new RangeError(SMART_INPUT_REQUIRED_ERROR)
+  return {
+    path: '/smart/session/start',
+    options: {
+      method: 'POST',
+      body: {
+        gpt_system_prompt: validatedGptPrompt,
+        minicpm_input_prompt: validatedInputPrompt,
+        model_provider: String(modelProvider || ''),
+        model_name: String(modelName || '')
+      },
+      timeoutMs: SERVER_START_TIMEOUT_MS
+    }
   }
 }
 
@@ -411,10 +542,20 @@ async function defaultPlaybackFactory(options = {}) {
   if (!AudioContextCtor) throw new Error('Audio playback is unavailable')
   const tracker = createResourceTracker()
   let queue = null
+  let resumeCount = 0
   let transferred = false
   try {
     const context = tracker.trackContext(new AudioContextCtor())
-    if (context.state === 'suspended') await context.resume()
+    const ensureRunning = async () => {
+      if (context.state === 'running') return
+      try {
+        await context.resume()
+        resumeCount += 1
+      } catch {
+        throw new Error('Audio playback is unavailable')
+      }
+    }
+    await ensureRunning()
     queue = queueFactory(context, {
       maxQueuedSeconds: MAX_PLAYBACK_SECONDS,
       maxQueuedBytes: MAX_PLAYBACK_RAW_BYTES
@@ -422,6 +563,8 @@ async function defaultPlaybackFactory(options = {}) {
     transferred = true
     return {
       ...queue,
+      ensureRunning,
+      snapshot() { return { ...queue.snapshot(), resumeCount } },
       async cleanup() {
         queue?.interrupt?.()
         await tracker.cleanup()
@@ -449,14 +592,40 @@ export function createVoiceRuntime({
   let muted = false
   let manuallyStopped = false
   let bargeIn = Boolean(storage.get('experimentalBargeIn', false))
+  let interactionMode = storage.get(VOICE_INTERACTION_MODE_KEY, NATIVE_MODE) === SMART_MODE
+    ? SMART_MODE
+    : NATIVE_MODE
   let silenceMs = Number(storage.get('silenceMs', DEFAULT_SILENCE_MS))
   if (!Number.isFinite(silenceMs) || silenceMs < MIN_SILENCE_MS || silenceMs > MAX_SILENCE_MS) silenceMs = DEFAULT_SILENCE_MS
+  let noiseThreshold = Number(storage.get(VOICE_TRIGGER_THRESHOLD_KEY, DEFAULT_NOISE_THRESHOLD))
+  if (
+    !Number.isFinite(noiseThreshold) ||
+    noiseThreshold < MIN_NOISE_THRESHOLD ||
+    noiseThreshold > MAX_NOISE_THRESHOLD
+  ) noiseThreshold = DEFAULT_NOISE_THRESHOLD
   const storedSystemPrompt = storage.get(USER_OWNED_MODEL_PROMPT_KEY, '')
   let storedPromptRejected = false
   let systemPrompt = ''
   if (typeof storedSystemPrompt === 'string') {
     try { systemPrompt = validateSystemPrompt(storedSystemPrompt) } catch { storedPromptRejected = true }
   }
+  const storedMinicpmInputPrompt = storage.get(MINICPM_INPUT_PROMPT_KEY, '')
+  let minicpmInputPrompt = ''
+  if (typeof storedMinicpmInputPrompt === 'string') {
+    try { minicpmInputPrompt = validateSystemPrompt(storedMinicpmInputPrompt) } catch { storedPromptRejected = true }
+  }
+  let smartModelProvider = boundedSmartIdentity(
+    storage.get(SMART_MODEL_PROVIDER_KEY, ''), MAX_SMART_PROVIDER_BYTES
+  )
+  let smartModelName = boundedSmartIdentity(
+    storage.get(SMART_MODEL_NAME_KEY, ''), MAX_SMART_MODEL_BYTES
+  )
+  let smartModelDraftProvider = smartModelProvider
+  let smartModelDraftName = smartModelName
+  let smartModelsCatalog = null
+  let smartModelsLoading = false
+  let smartModelsError = ''
+  let smartModelsRevision = 0
   let assistantText = ''
   let userTranscript = ''
   const turns = []
@@ -475,7 +644,8 @@ export function createVoiceRuntime({
   let playbackInitialization = null
   const playbackInitializationCleanups = new Set()
   let backendOwned = false
-  let vad = createVad({ silenceMs })
+  let backendMode = null
+  let vad = createVad({ silenceMs, threshold: noiseThreshold })
   let accumulator = createCaptureAccumulator()
   const preRoll = createPreRoll(PRE_ROLL_SAMPLES)
   let socketDispose = null
@@ -487,6 +657,7 @@ export function createVoiceRuntime({
   let pendingBargeSubmit = false
   let bargeQueued = false
   let submitQueued = false
+  let utteranceGeneration = 0
   let lifecycleTail = Promise.resolve()
   let lifecycleGeneration = 0
   let cancellationEpoch = 0
@@ -501,13 +672,26 @@ export function createVoiceRuntime({
   let serverPollRevision = 0
 
   const snapshot = () => ({
-    state, active, muted, manuallyStopped, bargeIn, silenceMs, assistantText,
+    state, active, muted, manuallyStopped, bargeIn: interactionMode === NATIVE_MODE && bargeIn,
+    interactionMode, minicpmInputPrompt, silenceMs, noiseThreshold, assistantText,
+    smartModelProvider, smartModelName, smartModelDraftProvider, smartModelDraftName,
+    smartModelAvailable: smartModelPairAvailable(smartModelsCatalog, smartModelProvider, smartModelName),
+    smartModelDraftAvailable: smartModelPairAvailable(
+      smartModelsCatalog, smartModelDraftProvider, smartModelDraftName
+    ),
+    smartModelsCatalog: smartModelsCatalog ? {
+      current: { ...smartModelsCatalog.current },
+      providers: smartModelsCatalog.providers.map(row => ({ ...row, models: [...row.models] }))
+    } : null,
+    smartModelsLoading, smartModelsError,
     userTranscript, turns: turns.map(turn => ({
       id: turn.id,
       userText: turn.userText,
       assistantText: turn.assistantText,
-      complete: turn.complete
+      complete: turn.complete,
+      ...(turn.userTextPending ? { userTextPending: true } : {})
     })), microphoneLevel, metrics, systemPrompt, errorMessage,
+    hasCurrentUtterance: vad.snapshot().speechStarted || accumulator.snapshot().sampleCount > 0,
     session_id: sessionId, generation: backendGeneration, busy: pendingOperations > 0,
     server: { ...server }, serverBusy: serverPendingOperations > 0,
     playback: playback?.snapshot?.() || { queuedSeconds: 0, queuedBytes: 0, droppedChunks: 0 }
@@ -517,6 +701,13 @@ export function createVoiceRuntime({
   const syncCompatibilityFields = () => {
     assistantText = activeTurn?.assistantText || ''
     userTranscript = activeTurn?.userText || ''
+  }
+  const clearVisibleHistory = () => {
+    turns.splice(0, turns.length)
+    activeTurn = null
+    historyTextBytes = 0
+    assistantText = ''
+    userTranscript = ''
   }
   const findTurn = turnId => (
     typeof turnId === 'string' && turnId ? turns.find(turn => turn.id === turnId) || null : null
@@ -543,14 +734,16 @@ export function createVoiceRuntime({
     if (turn === activeTurn) syncCompatibilityFields()
     return true
   }
-  const createPendingTurn = durationSeconds => {
+  const createPendingTurn = (durationSeconds, mode) => {
     const duration = Number.isFinite(durationSeconds) && durationSeconds >= 0 ? durationSeconds : 0
     const turn = {
       id: `local-${++localTurnCounter}`,
       pendingId: true,
-      userText: `Native audio · ${duration.toFixed(1)} s`,
+      userText: mode === SMART_MODE ? 'Interpreting audio...' : `Native audio · ${duration.toFixed(1)} s`,
+      userTextPending: mode === SMART_MODE,
       assistantText: '',
-      complete: false
+      complete: false,
+      lastUserTextDelta: null
     }
     turns.push(turn)
     historyTextBytes += utf8ByteLength(turn.userText)
@@ -573,7 +766,8 @@ export function createVoiceRuntime({
     return pending
   }
   const resetUtterance = ({ clearUser = false } = {}) => {
-    vad = createVad({ silenceMs })
+    utteranceGeneration += 1
+    vad = createVad({ silenceMs, threshold: noiseThreshold })
     accumulator = createCaptureAccumulator()
     preRoll.clear()
     if (clearUser && !activeTurn) userTranscript = ''
@@ -713,15 +907,18 @@ export function createVoiceRuntime({
     await Promise.all([...playbackInitializationCleanups])
   }
 
-  async function stopCreatedBackend() {
-    try { await rest('/session/stop', { method: 'POST', body: {} }) } catch {}
+  async function stopCreatedBackend(mode = backendMode || interactionMode) {
+    const path = mode === SMART_MODE ? '/smart/session/stop' : '/session/stop'
+    try { await rest(path, { method: 'POST', body: {} }) } catch {}
   }
 
   async function performEnd(epoch, { finalState = 'shell_ready', callBackend = backendOwned } = {}) {
     completePendingTurn(activeTurn, finalState === 'error' ? 'Turn failed.' : 'Turn interrupted.')
     manuallyStopped = true
     active = false
+    const modeToStop = backendMode || interactionMode
     backendOwned = false
+    backendMode = null
     sessionId = null
     backendGeneration = null
     receivedAudioBytes = 0
@@ -730,7 +927,7 @@ export function createVoiceRuntime({
     bargeQueued = false
     submitQueued = false
     await releaseBrowserResources()
-    if (callBackend) await stopCreatedBackend()
+    if (callBackend) await stopCreatedBackend(modeToStop)
     resetUtterance({ clearUser: true })
     if (epoch === cancellationEpoch) {
       state = finalState
@@ -748,22 +945,136 @@ export function createVoiceRuntime({
     notify()
   }
 
-  async function submitUtterance(operation) {
-    if (!owns(operation) || !active || muted || !vad.snapshot().speechStarted) return false
+  function safeSmartTurnErrorMessage(error) {
+    const message = String(error?.message || error || '')
+    if (message.includes('Smart input failed.')) return 'Smart input failed.'
+    if (message.includes('Smart reasoning failed.')) return 'Smart reasoning failed.'
+    return 'Smart turn failed.'
+  }
+
+  async function recoverSmartTurnFailure(operation, pendingTurn, error) {
+    const expectedSessionId = sessionId
+    const expectedGeneration = backendGeneration
+    if (pendingTurn?.userTextPending) {
+      pendingTurn.userTextPending = false
+      replaceTurnText(pendingTurn, 'userText', '')
+    }
+    if (completePendingTurn(pendingTurn, 'Turn failed.')) notify()
+
+    let interruptResult = null
+    let interruptSucceeded = false
+    try {
+      interruptResult = await rest('/smart/session/interrupt', {
+        method: 'POST', body: {}, timeoutMs: 20_000
+      })
+      interruptSucceeded = true
+    } catch {}
+
+    if (!owns(operation)) return false
+    const identityIsCurrent = (
+      active && backendOwned && backendMode === SMART_MODE &&
+      sessionId === expectedSessionId && backendGeneration === expectedGeneration
+    )
+    const interruptIdentityIsValid = !interruptSucceeded || (
+      interruptResult?.session_id === expectedSessionId &&
+      interruptResult?.generation === expectedGeneration
+    )
+    if (!identityIsCurrent || !interruptIdentityIsValid) {
+      const identityError = new Error('Smart turn recovery returned an invalid response')
+      await failCurrent(operation, identityError)
+      throw identityError
+    }
+
+    playbackCompletionRevision += 1
+    awaitingPlaybackDrain = false
+    resetUtterance()
+    playback?.interrupt?.()
+    errorMessage = safeSmartTurnErrorMessage(error).slice(0, 1024)
+    state = muted ? 'ready' : 'listening'
+    notify()
+    return false
+  }
+
+  async function submitUtterance(operation, expectedUtteranceGeneration = utteranceGeneration) {
+    if (
+      expectedUtteranceGeneration !== utteranceGeneration ||
+      !owns(operation) || !active || muted || !vad.snapshot().speechStarted
+    ) return false
     const samples = accumulator.samples()
     if (!samples.length) return false
-    const pendingTurn = createPendingTurn(samples.length / TARGET_SAMPLE_RATE)
+    const requestMode = backendMode || interactionMode
+    const pendingTurn = createPendingTurn(samples.length / TARGET_SAMPLE_RATE, requestMode)
     setState('thinking')
     resetUtterance()
+    let receivedTurnResponse = false
     try {
-      const result = await rest('/turn', {
+      const result = await rest(requestMode === SMART_MODE ? '/smart/turn' : '/turn', {
         method: 'POST',
         upload: { filename: 'turn.f32le.pcm', contentType: 'application/octet-stream', bytes: float32ToBytes(samples) },
-        timeoutMs: 130_000
+        timeoutMs: requestMode === SMART_MODE ? 360_000 : 130_000
       })
+      receivedTurnResponse = true
       if (!owns(operation)) {
         if (completePendingTurn(pendingTurn, 'Turn interrupted.')) notify()
         return false
+      }
+      if (requestMode === SMART_MODE) {
+        if (
+          result?.session_id !== sessionId || result?.generation !== backendGeneration ||
+          typeof result?.turn_id !== 'string' || !result.turn_id ||
+          typeof result?.user_text !== 'string' || !result.user_text.trim() ||
+          typeof result?.assistant_text !== 'string' || !result.assistant_text.trim()
+        ) throw new Error('Smart turn returned an invalid response')
+        const turn = pendingTurn === activeTurn ? reconcileTurn(result.turn_id) : null
+        if (!turn || turn.complete) return false
+        turn.userTextPending = false
+        replaceTurnText(turn, 'userText', utf8Prefix(result.user_text, TURN_TEXT_MAX_BYTES))
+        replaceTurnText(turn, 'assistantText', utf8Prefix(result.assistant_text, TURN_TEXT_MAX_BYTES))
+        turn.complete = true
+        trimHistory()
+        syncCompatibilityFields()
+        receivedAudioBytes = 0
+        if (result.audio_base64 !== null && result.audio_base64 !== undefined) {
+          if (result.sample_rate !== FALLBACK_PLAYBACK_RATE) throw new Error('Smart audio must use 24 kHz')
+          const playbackState = playback?.snapshot?.() || {}
+          const queueSecondRemaining = Math.max(
+            0,
+            (playbackState.maxQueuedSeconds ?? MAX_PLAYBACK_SECONDS) -
+              (playbackState.queuedSeconds || 0)
+          )
+          const maxDecodedBytes = Math.min(
+            MAX_PLAYBACK_RAW_BYTES,
+            Math.floor(queueSecondRemaining * FALLBACK_PLAYBACK_RATE) * 4,
+            Math.max(0, (playbackState.maxQueuedBytes ?? MAX_PLAYBACK_RAW_BYTES) - (playbackState.queuedBytes || 0))
+          )
+          const expectedSessionId = sessionId
+          const expectedGeneration = backendGeneration
+          await playback?.ensureRunning?.()
+          await playback?.warmup?.(FALLBACK_PLAYBACK_RATE, 0.5)
+          if (
+            !owns(operation) || sessionId !== expectedSessionId ||
+            backendGeneration !== expectedGeneration || pendingTurn !== activeTurn
+          ) return false
+          const decoded = decodeAudioBase64(String(result.audio_base64), { maxDecodedBytes })
+          if (!playback?.enqueue?.(decoded, FALLBACK_PLAYBACK_RATE, 1.0)) {
+            throw new Error('Smart playback queue budget exceeded')
+          }
+          receivedAudioBytes = decoded.byteLength
+          const revision = ++playbackCompletionRevision
+          awaitingPlaybackDrain = true
+          state = 'speaking'
+          if (typeof playback?.whenDrained === 'function') {
+            void playback.whenDrained().then(() => {
+              finishResponseAfterPlayback(revision, expectedSessionId, expectedGeneration)
+            })
+          }
+        } else {
+          awaitingPlaybackDrain = false
+          state = muted ? 'ready' : 'listening'
+          errorMessage = 'MiniCPM native speech failed.'
+        }
+        notify()
+        return true
       }
       if (pendingTurn === activeTurn) reconcileTurn(result?.turn_id)
       notify()
@@ -772,6 +1083,9 @@ export function createVoiceRuntime({
       if (!owns(operation)) {
         if (completePendingTurn(pendingTurn, 'Turn interrupted.')) notify()
         return false
+      }
+      if (requestMode === SMART_MODE && !receivedTurnResponse) {
+        return recoverSmartTurnFailure(operation, pendingTurn, error)
       }
       completePendingTurn(pendingTurn, 'Turn failed.')
       await failCurrent(operation, error)
@@ -783,10 +1097,11 @@ export function createVoiceRuntime({
     if (submitQueued || disposed) return
     submitQueued = true
     const epoch = cancellationEpoch
+    const scheduledUtteranceGeneration = utteranceGeneration
     void enqueue(epoch, async scheduledEpoch => {
       try {
         if (scheduledEpoch !== cancellationEpoch || disposed) return false
-        return await submitUtterance(beginOperation(scheduledEpoch))
+        return await submitUtterance(beginOperation(scheduledEpoch), scheduledUtteranceGeneration)
       } finally {
         submitQueued = false
       }
@@ -816,9 +1131,9 @@ export function createVoiceRuntime({
         else if (bargeRestarting) pendingBargeSubmit = true
         else scheduleSubmit()
       }
-    } else if (state === 'speaking' && bargeIn && !bargeRestarting) {
+    } else if (state === 'speaking' && interactionMode === NATIVE_MODE && bargeIn && !bargeRestarting) {
       preRoll.push(samples)
-      bargeSpeechMs = level >= 0.02 ? bargeSpeechMs + durationMs : 0
+      bargeSpeechMs = level >= noiseThreshold ? bargeSpeechMs + durationMs : 0
       if (bargeSpeechMs >= 300) scheduleAutomaticBargeIn()
     }
     notify()
@@ -831,7 +1146,7 @@ export function createVoiceRuntime({
       const retained = preRoll.samples()
       accumulator = createCaptureAccumulator(MAX_CAPTURE_SAMPLES + retained.length)
       accumulator.append(retained)
-      vad = createVad({ silenceMs })
+      vad = createVad({ silenceMs, threshold: noiseThreshold })
       vad.push(0.1, Math.max(1, Math.min(bargeSpeechMs, retained.length * 1000 / TARGET_SAMPLE_RATE)))
       preRoll.clear()
     } else {
@@ -931,6 +1246,58 @@ export function createVoiceRuntime({
   const runtime = {
     snapshot,
     subscribe(listener) { listeners.add(listener); listener(snapshot()); return () => listeners.delete(listener) },
+    loadSmartModels(refresh = false) {
+      if (disposed) return Promise.reject(new Error('voice runtime is disposed'))
+      const revision = ++smartModelsRevision
+      smartModelsLoading = true
+      smartModelsError = ''
+      notify()
+      const path = refresh ? '/smart/models?refresh=true' : '/smart/models'
+      return Promise.resolve(rest(path)).then(result => {
+        const catalog = normalizeSmartModelsCatalog(result)
+        if (disposed || revision !== smartModelsRevision) return snapshot()
+        smartModelsCatalog = catalog
+        smartModelsLoading = false
+        notify()
+        return snapshot()
+      }).catch(() => {
+        if (!disposed && revision === smartModelsRevision) {
+          smartModelsLoading = false
+          smartModelsError = 'Model catalog is unavailable.'
+          notify()
+        }
+        throw new Error('Model catalog is unavailable.')
+      })
+    },
+    setSmartModelProviderDraft(value) {
+      if (active || pendingOperations > 0 || serverPendingOperations > 0 || smartModelsLoading) return false
+      const provider = boundedSmartIdentity(value, MAX_SMART_PROVIDER_BYTES)
+      if (value && !provider) return false
+      smartModelDraftProvider = provider
+      smartModelDraftName = ''
+      notify()
+      return true
+    },
+    setSmartModelNameDraft(value) {
+      if (active || pendingOperations > 0 || serverPendingOperations > 0 || smartModelsLoading) return false
+      const model = boundedSmartIdentity(value, MAX_SMART_MODEL_BYTES)
+      if (value && !model) return false
+      smartModelDraftName = model
+      notify()
+      return true
+    },
+    saveSmartModel() {
+      if (
+        active || pendingOperations > 0 || serverPendingOperations > 0 || smartModelsLoading ||
+        !smartModelPairAvailable(smartModelsCatalog, smartModelDraftProvider, smartModelDraftName)
+      ) return false
+      smartModelProvider = smartModelDraftProvider
+      smartModelName = smartModelDraftName
+      storage.set(SMART_MODEL_PROVIDER_KEY, smartModelProvider)
+      storage.set(SMART_MODEL_NAME_KEY, smartModelName)
+      notify()
+      return true
+    },
     bindSocket(socket) {
       if (disposed) return
       socketDispose?.()
@@ -971,7 +1338,7 @@ export function createVoiceRuntime({
             notify()
           }
         }
-        if (!active) return
+        if (!active || interactionMode === SMART_MODE) return
         try {
           const status = await rest('/status')
           if (
@@ -1063,6 +1430,14 @@ export function createVoiceRuntime({
       if (disposed) return Promise.reject(new Error('voice runtime is disposed'))
       if (arguments.length > 0) runtime.setSystemPrompt(prompt)
       else if (storedPromptRejected) return Promise.reject(new RangeError(SYSTEM_PROMPT_LIMIT_ERROR))
+      if (
+        interactionMode === SMART_MODE &&
+        !smartModelPairAvailable(smartModelsCatalog, smartModelProvider, smartModelName)
+      ) {
+        errorMessage = 'Model selection is unavailable.'
+        notify()
+        return Promise.reject(new Error(errorMessage))
+      }
       const epoch = cancellationEpoch
       const playbackPrime = primePlayback(epoch)
       return enqueue(epoch, async scheduledEpoch => {
@@ -1078,27 +1453,32 @@ export function createVoiceRuntime({
         try {
           if (!await ensurePlayback(operation, playbackPrime)) return snapshot()
           if (!owns(operation)) return snapshot()
-          const request = buildSessionStartRequest(systemPrompt)
+          const request = interactionMode === SMART_MODE
+            ? buildSmartSessionStartRequest(
+                systemPrompt, minicpmInputPrompt, smartModelProvider, smartModelName
+              )
+            : buildSessionStartRequest(systemPrompt)
           const result = await rest(request.path, request.options)
           backendCreated = true
           if (!owns(operation)) {
-            await stopCreatedBackend()
+            await stopCreatedBackend(interactionMode)
             await releaseBrowserResources()
             return snapshot()
           }
           if (!await ensureCapture(operation)) {
-            await stopCreatedBackend()
+            await stopCreatedBackend(interactionMode)
             await releaseBrowserResources()
             return snapshot()
           }
           if (!owns(operation)) {
-            await stopCreatedBackend()
+            await stopCreatedBackend(interactionMode)
             await releaseBrowserResources()
             return snapshot()
           }
           sessionId = typeof result?.session_id === 'string' ? result.session_id : null
           backendGeneration = Number.isInteger(result?.generation) ? result.generation : null
           backendOwned = true
+          backendMode = interactionMode
           active = true
           state = result?.state || 'listening'
           if (state === 'ready') state = 'listening'
@@ -1117,13 +1497,87 @@ export function createVoiceRuntime({
     },
     manualDone() {
       const epoch = cancellationEpoch
+      const scheduledUtteranceGeneration = utteranceGeneration
       return enqueue(epoch, async scheduledEpoch => {
         if (scheduledEpoch !== cancellationEpoch || disposed) return false
-        return submitUtterance(beginOperation(scheduledEpoch))
+        return submitUtterance(beginOperation(scheduledEpoch), scheduledUtteranceGeneration)
+      })
+    },
+    discardUtterance() {
+      const hasCurrentUtterance = vad.snapshot().speechStarted || accumulator.snapshot().sampleCount > 0
+      if (!hasCurrentUtterance) return false
+      resetUtterance()
+      notify()
+      return true
+    },
+    clearChat() {
+      if (disposed) return Promise.reject(new Error('voice runtime is disposed'))
+      if (!turns.length || pendingOperations > 0 || serverPendingOperations > 0) {
+        return Promise.resolve(snapshot())
+      }
+      if (active && interactionMode === NATIVE_MODE) return Promise.resolve(snapshot())
+      if (!active) {
+        clearVisibleHistory()
+        notify()
+        return Promise.resolve(snapshot())
+      }
+
+      const expectedSessionId = sessionId
+      const expectedGeneration = backendGeneration
+      pendingOperations += 1
+      notify()
+      return Promise.resolve().then(() => rest('/smart/session/clear-history', {
+        method: 'POST', body: {}
+      })).then(result => {
+        if (
+          !active || interactionMode !== SMART_MODE ||
+          sessionId !== expectedSessionId || backendGeneration !== expectedGeneration ||
+          (result !== null && result !== undefined && (
+            result.session_id !== expectedSessionId || result.generation !== expectedGeneration
+          ))
+        ) throw new Error('Smart clear history returned an invalid response')
+        clearVisibleHistory()
+        state = 'listening'
+        notify()
+        return snapshot()
+      }).finally(() => {
+        pendingOperations = Math.max(0, pendingOperations - 1)
+        notify()
       })
     },
     interrupt() {
       if (active && completePendingTurn(activeTurn, 'Turn interrupted.')) notify()
+      if (interactionMode === SMART_MODE) {
+        const epoch = invalidateOperations()
+        playback?.interrupt?.()
+        resetUtterance()
+        if (!active || disposed) return Promise.resolve(snapshot())
+        const operation = beginOperation(epoch)
+        pendingOperations += 1
+        state = 'thinking'
+        notify()
+        return Promise.resolve(rest('/smart/session/interrupt', {
+          method: 'POST', body: {}, timeoutMs: 20_000
+        })).then(result => {
+          if (!owns(operation) || !active) return snapshot()
+          if (result?.session_id !== sessionId || result?.generation !== backendGeneration) {
+            throw new Error('Smart interrupt returned an invalid response')
+          }
+          state = muted ? 'ready' : 'listening'
+          notify()
+          return snapshot()
+        }).catch(error => {
+          if (owns(operation)) {
+            errorMessage = String(error?.message || error || 'Smart interrupt failed').slice(0, 1024)
+            state = 'error'
+            notify()
+          }
+          throw error
+        }).finally(() => {
+          pendingOperations = Math.max(0, pendingOperations - 1)
+          notify()
+        })
+      }
       const epoch = cancellationEpoch
       return enqueue(epoch, async scheduledEpoch => {
         if (scheduledEpoch !== cancellationEpoch || disposed || !active) return snapshot()
@@ -1163,6 +1617,33 @@ export function createVoiceRuntime({
         return false
       }
     },
+    setMinicpmInputPrompt(value) {
+      const next = validateSystemPrompt(String(value))
+      storage.set(MINICPM_INPUT_PROMPT_KEY, next)
+      minicpmInputPrompt = next
+      if (errorMessage === SMART_INPUT_REQUIRED_ERROR) errorMessage = ''
+      notify()
+    },
+    setMinicpmInputPromptFromUi(value) {
+      try {
+        runtime.setMinicpmInputPrompt(value)
+        return true
+      } catch (error) {
+        if (!(error instanceof RangeError)) throw error
+        errorMessage = String(error.message || SYSTEM_PROMPT_LIMIT_ERROR).slice(0, 1024)
+        notify()
+        return false
+      }
+    },
+    setInteractionMode(value) {
+      if (active || pendingOperations > 0 || serverPendingOperations > 0) return false
+      if (value !== NATIVE_MODE && value !== SMART_MODE) throw new RangeError('unsupported voice interaction mode')
+      interactionMode = value
+      storage.set(VOICE_INTERACTION_MODE_KEY, value)
+      if (interactionMode === SMART_MODE) bargeRestarting = false
+      notify()
+      return true
+    },
     setBargeIn(value) { bargeIn = Boolean(value); storage.set('experimentalBargeIn', bargeIn); notify() },
     setSilenceMs(value) {
       const next = Math.max(MIN_SILENCE_MS, Math.min(MAX_SILENCE_MS, Number(value) || DEFAULT_SILENCE_MS))
@@ -1171,8 +1652,75 @@ export function createVoiceRuntime({
       resetUtterance()
       notify()
     },
+    setNoiseThreshold(value) {
+      const numeric = Number(value)
+      const next = Number.isFinite(numeric)
+        ? Math.max(MIN_NOISE_THRESHOLD, Math.min(MAX_NOISE_THRESHOLD, numeric))
+        : DEFAULT_NOISE_THRESHOLD
+      if (next !== noiseThreshold) {
+        utteranceGeneration += 1
+        accumulator = createCaptureAccumulator()
+        preRoll.clear()
+        bargeSpeechMs = 0
+        noiseThreshold = next
+        vad = createVad({ silenceMs, threshold: noiseThreshold })
+      }
+      storage.set(VOICE_TRIGGER_THRESHOLD_KEY, next)
+      notify()
+      return next
+    },
     handleEvent(event) {
       if (!event || typeof event !== 'object') return
+      if (interactionMode === SMART_MODE) {
+        if (event.type === 'smart.user_text.delta') {
+          const exactKeys = ['type', 'session_id', 'generation', 'turn_id', 'text']
+          if (
+            Object.keys(event).length !== exactKeys.length ||
+            !exactKeys.every(key => Object.prototype.hasOwnProperty.call(event, key)) ||
+            !matchesCurrentSession(event) ||
+            typeof event.turn_id !== 'string' || !event.turn_id.trim() ||
+            utf8ByteLength(event.turn_id) > TURN_ID_MAX_BYTES ||
+            typeof event.text !== 'string' || !event.text.length ||
+            utf8ByteLength(event.text) > TURN_TEXT_MAX_BYTES ||
+            !activeTurn || activeTurn.complete
+          ) return
+          const turn = activeTurn.pendingId
+            ? reconcileTurn(event.turn_id)
+            : activeTurn.id === event.turn_id ? activeTurn : null
+          if (!turn || turn.complete || turn.lastUserTextDelta === event.text) return
+          turn.lastUserTextDelta = event.text
+          const nextUserText = turn.userTextPending ? event.text : turn.userText + event.text
+          turn.userTextPending = false
+          replaceTurnText(
+            turn,
+            'userText',
+            utf8Prefix(nextUserText, TURN_TEXT_MAX_BYTES)
+          )
+          trimHistory()
+          syncCompatibilityFields()
+          notify()
+          return
+        }
+        if (event.type !== 'smart.user_text' || !matchesCurrentSession(event)) return
+        if (
+          typeof event.turn_id !== 'string' || !event.turn_id.trim() ||
+          utf8ByteLength(event.turn_id) > TURN_ID_MAX_BYTES ||
+          typeof event.text !== 'string' || !event.text.trim() ||
+          utf8ByteLength(event.text) > TURN_TEXT_MAX_BYTES ||
+          !activeTurn || activeTurn.complete
+        ) return
+        const turn = activeTurn.pendingId
+          ? reconcileTurn(event.turn_id)
+          : activeTurn.id === event.turn_id ? activeTurn : null
+        if (!turn || turn.complete) return
+        turn.lastUserTextDelta = null
+        turn.userTextPending = false
+        replaceTurnText(turn, 'userText', event.text)
+        trimHistory()
+        syncCompatibilityFields()
+        notify()
+        return
+      }
       if (!(matchesCurrentSession(event) || (event.type === 'status' && matchesCurrentStatus(event)))) return
       if (event.type === 'state' || event.type === 'status') {
         if (event.state === 'error') {
@@ -1301,6 +1849,9 @@ export function createVoiceRuntime({
 
 function EnglishCoachPage({ runtime }) {
   const [view, setView] = useState(() => runtime.snapshot())
+  const [controlsExpanded, setControlsExpanded] = useState(false)
+  const [serverDetailsExpanded, setServerDetailsExpanded] = useState(false)
+  const [promptsExpanded, setPromptsExpanded] = useState(false)
   const historyRef = useRef(null)
   const previousLatestTurnIdRef = useRef(null)
   const followLatestRef = useRef(true)
@@ -1311,6 +1862,10 @@ function EnglishCoachPage({ runtime }) {
       void runtime.end()
     }
   }, [runtime])
+  useEffect(() => {
+    const loading = runtime.loadSmartModels?.(false)
+    if (loading && typeof loading.catch === 'function') void loading.catch(() => undefined)
+  }, [runtime, view.interactionMode])
   const latestTurn = view.turns?.at(-1)
   const latestTurnId = latestTurn?.id || null
   const latestAssistantText = latestTurn?.assistantText || ''
@@ -1343,10 +1898,24 @@ function EnglishCoachPage({ runtime }) {
   }, [])
   const act = useCallback(action => { void action().catch(() => undefined) }, [])
   const status = useMemo(() => String(view.state), [view.state])
+  const smartMode = view.interactionMode === SMART_MODE
+  const displayedNoiseThreshold = Number.isFinite(view.noiseThreshold)
+    ? view.noiseThreshold
+    : DEFAULT_NOISE_THRESHOLD
   const serverView = view.server || normalizeServerStatus(null)
   const serverUsableForVoice = serverView.state === 'ready' || serverView.state === 'external'
   const startServerDisabled = view.serverBusy || ['starting', 'ready', 'external'].includes(serverView.state)
   const stopServerDisabled = view.serverBusy || !(serverView.managed && serverView.running)
+  const smartProviderRows = view.smartModelsCatalog?.providers || []
+  const smartDraftProvider = view.smartModelDraftProvider || ''
+  const smartDraftName = view.smartModelDraftName || ''
+  const smartDraftRow = smartProviderRows.find(row => row.provider === smartDraftProvider)
+  const smartDraftModels = smartDraftRow?.models || []
+  const savedSmartModelText = view.smartModelProvider && view.smartModelName
+    ? `${view.smartModelProvider} / ${view.smartModelName}`
+    : 'Current Hermes model'
+  const smartSavedUnavailable = view.smartModelAvailable === false
+  const smartControlsDisabled = view.active || view.busy || view.serverBusy || view.smartModelsLoading
 
   return jsxs('main', {
     style: {
@@ -1360,42 +1929,222 @@ function EnglishCoachPage({ runtime }) {
             jsx('h1', { style: { margin: 0 }, children: 'English Coach' }),
             jsx(Badge, { children: status })
           ] }),
-          jsx('p', { style: { color: 'var(--ui-text-secondary)' }, children: 'Native audio · Turn-based streaming (V2)' })
+          jsx('p', {
+            style: { color: 'var(--ui-text-secondary)' },
+            children: smartMode
+              ? 'Smart · MiniCPM input → Hermes text model → MiniCPM native voice'
+              : 'Native audio · Turn-based streaming (V2)'
+          })
         ]
       }),
       jsxs('section', {
-        'aria-label': 'Local MiniCPM server controls',
-        style: { display: 'grid', gap: '0.5rem', padding: '0.75rem', border: '1px solid var(--ui-border)' },
+        'aria-label': 'Controls',
+        style: { display: 'grid', gap: controlsExpanded ? '0.75rem' : 0 },
         children: [
-          jsx('strong', { children: `Server: ${serverView.state}` }),
-          jsx('p', { style: { margin: 0, color: 'var(--ui-text-secondary)' }, children: serverView.message }),
-          jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }, children: [
-            jsx(Button, {
-              disabled: startServerDisabled,
-              onClick: () => act(() => runtime.startServer()),
-              children: 'Start Server'
-            }),
-            jsx(Button, {
-              disabled: stopServerDisabled,
-              onClick: () => act(() => runtime.stopServer()),
-              children: 'Stop Server'
-            })
-          ] })
+          jsxs('div', {
+            style: { display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'nowrap' },
+            children: [
+              jsx('strong', { children: 'Controls' }),
+              jsx(Badge, { children: smartMode ? 'Smart mode' : 'Native mode' }),
+              jsx(Button, {
+                'aria-expanded': controlsExpanded,
+                'aria-controls': 'minicpm-controls-details',
+                onClick: () => setControlsExpanded(value => !value),
+                children: controlsExpanded ? 'Hide' : 'Details'
+              })
+            ]
+          }),
+          controlsExpanded ? jsxs('div', {
+            id: 'minicpm-controls-details',
+            style: { display: 'grid', gap: '1rem' },
+            children: [
+      jsxs('label', { style: { display: 'flex', alignItems: 'center', gap: '0.5rem' }, children: [
+        jsx(Switch, {
+          checked: smartMode,
+          disabled: view.active || view.busy || view.serverBusy,
+          onCheckedChange: value => runtime.setInteractionMode(value ? SMART_MODE : NATIVE_MODE)
+        }),
+        smartMode ? 'Smart mode' : 'Native mode (default)'
+      ] }),
+      jsxs('section', {
+        'aria-label': 'Local MiniCPM server controls',
+        style: { display: 'grid', gap: serverDetailsExpanded ? '0.5rem' : 0 },
+        children: [
+          jsxs('div', {
+            style: { display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'nowrap' },
+            children: [
+              jsx('strong', { children: 'Server' }),
+              jsx(Badge, { children: serverView.state }),
+              jsx(Button, {
+                'aria-expanded': serverDetailsExpanded,
+                'aria-controls': 'minicpm-server-details',
+                onClick: () => setServerDetailsExpanded(value => !value),
+                children: 'Details'
+              })
+            ]
+          }),
+          serverDetailsExpanded ? jsxs('div', {
+            id: 'minicpm-server-details',
+            style: { display: 'grid', gap: '0.5rem' },
+            children: [
+              jsx('p', { style: { margin: 0, color: 'var(--ui-text-secondary)' }, children: serverView.message }),
+              jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }, children: [
+                jsx(Button, {
+                  disabled: startServerDisabled,
+                  onClick: () => act(() => runtime.startServer()),
+                  children: 'Start Server'
+                }),
+                jsx(Button, {
+                  disabled: stopServerDisabled,
+                  onClick: () => act(() => runtime.stopServer()),
+                  children: 'Stop Server'
+                })
+              ] })
+            ]
+          }) : null
         ]
       }),
-      jsx(Textarea, {
-        value: view.systemPrompt,
-        maxLength: MAX_SYSTEM_PROMPT_BYTES,
-        placeholder: 'Optional instructions you write for the model',
-        onChange: event => runtime.setSystemPromptFromUi(event.target.value),
-        'aria-label': 'User-owned model prompt'
+      smartMode ? jsxs('section', {
+        'aria-label': 'Smart model controls',
+        style: { display: 'grid', gap: '0.5rem' },
+        children: [
+          jsxs('div', {
+            style: { display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' },
+            children: [
+              jsx('strong', { children: 'Smart model' }),
+              jsx(Badge, { children: savedSmartModelText }),
+              smartSavedUnavailable ? jsx(Badge, { children: 'unavailable' }) : null
+            ]
+          }),
+          jsxs('div', {
+            style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: '0.5rem' },
+            children: [
+              jsxs('label', { style: { display: 'grid', gap: '0.25rem' }, children: [
+                'Provider',
+                jsxs('select', {
+                  'aria-label': 'Smart model provider',
+                  value: smartDraftProvider,
+                  disabled: smartControlsDisabled,
+                  onChange: event => runtime.setSmartModelProviderDraft(event.target.value),
+                  children: [
+                    jsx('option', { value: '', children: 'Current Hermes model' }),
+                    ...smartProviderRows.map(row => jsx('option', {
+                      value: row.provider, children: row.label
+                    }, row.provider)),
+                    smartDraftProvider && !smartProviderRows.some(row => row.provider === smartDraftProvider)
+                      ? jsx('option', { value: smartDraftProvider, children: `${smartDraftProvider} (unavailable)` })
+                      : null
+                  ]
+                })
+              ] }),
+              jsxs('label', { style: { display: 'grid', gap: '0.25rem' }, children: [
+                'Model',
+                jsxs('select', {
+                  'aria-label': 'Smart model name',
+                  value: smartDraftName,
+                  disabled: smartControlsDisabled || !smartDraftProvider,
+                  onChange: event => runtime.setSmartModelNameDraft(event.target.value),
+                  children: [
+                    jsx('option', { value: '', children: smartDraftProvider ? 'Select model' : 'Current Hermes model' }),
+                    ...smartDraftModels.map(model => jsx('option', { value: model, children: model }, model)),
+                    smartDraftName && !smartDraftModels.includes(smartDraftName)
+                      ? jsx('option', { value: smartDraftName, children: `${smartDraftName} (unavailable)` })
+                      : null
+                  ]
+                })
+              ] })
+            ]
+          }),
+          jsxs('div', { style: { display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }, children: [
+            jsx(Button, {
+              disabled: smartControlsDisabled || view.smartModelDraftAvailable !== true,
+              onClick: () => runtime.saveSmartModel(),
+              children: 'Save model'
+            }),
+            jsx(Button, {
+              disabled: Boolean(view.smartModelsLoading),
+              onClick: () => act(() => runtime.loadSmartModels(true)),
+              children: 'Refresh models'
+            }),
+            jsx(Button, {
+              onClick: () => host.navigate('/settings?tab=config:model'),
+              children: 'Manage providers'
+            })
+          ] }),
+          smartSavedUnavailable ? jsx('p', {
+            role: 'alert',
+            style: { margin: 0 },
+            children: 'The saved Smart model is unavailable. Choose an available pair or Current Hermes model, then Save model.'
+          }) : null,
+          view.smartModelsError ? jsx('p', { role: 'alert', style: { margin: 0 }, children: view.smartModelsError }) : null
+        ]
+      }) : null,
+      jsxs('section', {
+        'aria-label': 'Prompt controls',
+        style: { display: 'grid', gap: promptsExpanded ? '0.5rem' : 0 },
+        children: [
+          jsxs('div', {
+            style: { display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' },
+            children: [
+              jsx('strong', { children: 'Prompts' }),
+              jsx(Badge, { children: `MiniCPM ${view.minicpmInputPrompt ? 'set' : 'unset'}` }),
+              jsx(Badge, { children: `Coach ${view.systemPrompt ? 'set' : 'unset'}` }),
+              jsx(Button, {
+                'aria-expanded': promptsExpanded,
+                'aria-controls': 'minicpm-prompt-details',
+                onClick: () => setPromptsExpanded(value => !value),
+                children: promptsExpanded ? 'Hide' : 'Details'
+              })
+            ]
+          }),
+          promptsExpanded ? jsxs('div', {
+            id: 'minicpm-prompt-details',
+            style: { display: 'grid', gap: '0.5rem' },
+            children: [
+              jsxs('label', { style: { display: 'grid', gap: '0.375rem' }, children: [
+                'GPT/Coach model prompt (optional; applies on the next session)',
+                jsx(Textarea, {
+                  value: view.systemPrompt,
+                  maxLength: MAX_SYSTEM_PROMPT_BYTES,
+                  placeholder: 'Optional instructions you write for the model',
+                  onChange: event => runtime.setSystemPromptFromUi(event.target.value),
+                  'aria-label': 'User-owned model prompt'
+                })
+              ] }),
+              jsxs('label', { style: { display: 'grid', gap: '0.375rem' }, children: [
+                'MiniCPM input-understanding prompt (required for Smart Start)',
+                jsx(Textarea, {
+                  value: view.minicpmInputPrompt || '',
+                  maxLength: MAX_SYSTEM_PROMPT_BYTES,
+                  placeholder: 'Your instructions for understanding the recorded audio',
+                  onChange: event => runtime.setMinicpmInputPromptFromUi(event.target.value),
+                  'aria-label': 'MiniCPM input-understanding prompt'
+                })
+              ] })
+            ]
+          }) : null
+        ]
       }),
       jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }, children: [
-        jsx(Button, { disabled: view.active || view.busy || !serverUsableForVoice, onClick: () => act(() => runtime.start()), children: 'Start' }),
+        jsx(Button, {
+          disabled: view.active || view.busy || (!smartMode && !serverUsableForVoice) ||
+            (smartMode && view.smartModelAvailable === false),
+          onClick: () => act(() => runtime.start()), children: 'Start'
+        }),
         jsx(Button, { disabled: !view.active, onClick: () => runtime.setMuted(!view.muted), children: view.muted ? 'Unmute' : 'Mute' }),
         jsx(Button, { disabled: !view.active || view.muted, onClick: () => act(() => runtime.manualDone()), children: "I'm done" }),
+        jsx(Button, {
+          disabled: !view.active || view.muted || view.state !== 'listening' || !view.hasCurrentUtterance,
+          onClick: () => runtime.discardUtterance(),
+          children: 'Discard utterance'
+        }),
         jsx(Button, { disabled: !view.active, onClick: () => act(() => runtime.interrupt()), children: 'Interrupt' }),
-        jsx(Button, { disabled: !view.active, onClick: () => act(() => runtime.end()), children: 'End' })
+        jsx(Button, { disabled: !view.active, onClick: () => act(() => runtime.end()), children: 'End' }),
+        jsx(Button, {
+          disabled: view.busy || view.serverBusy || !(view.turns || []).length || (view.active && !smartMode),
+          onClick: () => act(() => runtime.clearChat()),
+          children: 'Clear chat'
+        })
       ] }),
       jsxs('label', { children: [
         `End-of-turn silence: ${view.silenceMs} ms`,
@@ -1404,10 +2153,24 @@ function EnglishCoachPage({ runtime }) {
           onChange: event => runtime.setSilenceMs(Number(event.target.value))
         })
       ] }),
-      jsxs('label', { style: { display: 'flex', alignItems: 'center', gap: '0.5rem' }, children: [
-        jsx(Switch, { checked: view.bargeIn, onCheckedChange: value => runtime.setBargeIn(value) }),
-        'Experimental automatic barge-in (off by default)'
+      jsxs('label', { children: [
+        `Voice trigger threshold: ${displayedNoiseThreshold.toFixed(3)}`,
+        jsx(Input, {
+          type: 'range', min: MIN_NOISE_THRESHOLD, max: MAX_NOISE_THRESHOLD,
+          step: NOISE_THRESHOLD_STEP, value: displayedNoiseThreshold,
+          onChange: event => runtime.setNoiseThreshold(Number(event.target.value))
+        })
       ] }),
+      jsxs('label', { style: { display: 'flex', alignItems: 'center', gap: '0.5rem' }, children: [
+        jsx(Switch, { checked: smartMode ? false : view.bargeIn, disabled: smartMode, onCheckedChange: value => runtime.setBargeIn(value) }),
+        smartMode
+          ? 'Smart mode is turn-based; barge-in is disabled (not full duplex).'
+          : 'Experimental automatic barge-in (off by default)'
+      ] })
+            ]
+          }) : null
+        ]
+      }),
       jsx('div', {
         role: 'meter', 'aria-label': 'Microphone level', 'aria-valuemin': 0, 'aria-valuemax': 1,
         'aria-valuenow': view.microphoneLevel,
@@ -1426,16 +2189,22 @@ function EnglishCoachPage({ runtime }) {
           ? view.turns.map(turn => jsxs('div', {
             style: { display: 'flex', flexDirection: 'column', gap: '0.375rem' },
             children: [
-              jsx('div', {
+              turn.userText ? jsx('div', {
                 'data-bubble-side': 'right', 'data-turn-id': turn.id,
-                'aria-label': `User turn ${turn.id}`,
+                'data-user-text-pending': turn.userTextPending || undefined,
+                role: turn.userTextPending ? 'status' : undefined,
+                'aria-label': turn.userTextPending
+                  ? `Audio interpretation status for turn ${turn.id}`
+                  : `User turn ${turn.id}`,
                 style: {
                   alignSelf: 'flex-end', maxWidth: '80%', padding: '0.625rem 0.75rem',
                   border: '1px solid var(--ui-border)', borderRadius: '0.75rem',
-                  background: 'var(--ui-bg-secondary)', overflowWrap: 'anywhere'
+                  background: 'var(--ui-bg-secondary)', overflowWrap: 'anywhere',
+                  color: turn.userTextPending ? 'var(--ui-text-secondary)' : 'var(--ui-text-primary)',
+                  fontStyle: turn.userTextPending ? 'italic' : 'normal'
                 },
                 children: turn.userText
-              }),
+              }) : null,
               jsx('div', {
                 'data-bubble-side': 'left', 'data-turn-id': turn.id,
                 'aria-label': `Assistant turn ${turn.id}`,
@@ -1462,10 +2231,15 @@ function EnglishCoachPage({ runtime }) {
 }
 
 export const __test = {
+  DEFAULT_NOISE_THRESHOLD,
   EnglishCoachPage,
   HISTORY_TEXT_MAX_BYTES,
+  MAX_NOISE_THRESHOLD,
   MAX_SYSTEM_PROMPT_BYTES,
+  MIN_NOISE_THRESHOLD,
+  NOISE_THRESHOLD_STEP,
   buildSessionStartRequest,
+  buildSmartSessionStartRequest,
   bytesToFloat32,
   createCaptureAccumulator,
   createPlaybackQueue,

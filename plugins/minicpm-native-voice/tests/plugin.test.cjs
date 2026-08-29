@@ -110,6 +110,24 @@ function elementText(value) {
   return elementText(value.props?.children)
 }
 
+function controlSection(page) {
+  return descendants(page).find(element => element.props?.['aria-label'] === 'Controls')
+}
+
+function controlToggle(page) {
+  return descendants(controlSection(page)).find(element => (
+    element.type === 'Button' && ['Details', 'Hide'].includes(elementText(element))
+  ))
+}
+
+function expandControls(renderer, page) {
+  const toggle = controlToggle(page)
+  assert.ok(toggle, 'Controls toggle must render')
+  assert.equal(toggle.props['aria-expanded'], false)
+  toggle.props.onClick()
+  return renderer.render()
+}
+
 function createHookRenderer() {
   const hooks = []
   let component = null
@@ -221,8 +239,9 @@ class FakeAudioContext {
       length,
       sampleRate,
       duration: length / sampleRate,
+      data: new Float32Array(length),
       copied: null,
-      copyToChannel(samples) { this.copied = Array.from(samples) }
+      copyToChannel(samples) { this.data.set(samples); this.copied = Array.from(samples) }
     }
     this.buffers.push(buffer)
     return buffer
@@ -232,11 +251,13 @@ class FakeAudioContext {
     const source = {
       buffer: null,
       connected: null,
+      playbackRate: { value: 1 },
       starts: [],
+      offsets: [],
       stopped: 0,
       connect(destination) { this.connected = destination },
       disconnect() { this.disconnected = true },
-      start(when) { this.starts.push(when) },
+      start(when, offset) { this.starts.push(when); this.offsets.push(offset) },
       stop() { this.stopped += 1 }
     }
     this.sources.push(source)
@@ -273,6 +294,128 @@ test('VAD never submits initial silence', () => {
     assert.equal(vad.push(0.001, 100).end, false)
   }
   assert.equal(vad.snapshot().speechStarted, false)
+})
+
+test('voice trigger threshold defaults to 0.040 and keeps explicit VAD thresholds', () => {
+  const { testApi } = loadPlugin()
+
+  assert.equal(testApi.DEFAULT_NOISE_THRESHOLD, 0.04)
+  assert.equal(testApi.MIN_NOISE_THRESHOLD, 0.005)
+  assert.equal(testApi.MAX_NOISE_THRESHOLD, 0.1)
+  assert.equal(testApi.NOISE_THRESHOLD_STEP, 0.005)
+
+  const defaultVad = testApi.createVad()
+  assert.equal(defaultVad.push(0.03, 100).speechStarted, false)
+  assert.equal(defaultVad.push(0.05, 100).speechStarted, true)
+
+  const explicitVad = testApi.createVad({ threshold: 0.02 })
+  assert.equal(explicitVad.push(0.03, 100).speechStarted, true)
+})
+
+test('runtime validates, persists, snapshots, and applies the current voice trigger threshold atomically', async () => {
+  const { testApi } = loadPlugin()
+  const writes = []
+  const submitted = []
+  let onFrame = null
+  const runtime = testApi.createVoiceRuntime({
+    rest: async (path, options) => {
+      if (path === '/session/start') return { state: 'listening', session_id: 's1', generation: 1 }
+      if (path === '/turn') {
+        submitted.push(testApi.bytesToFloat32(options.upload.bytes))
+        return { state: 'thinking', session_id: 's1', generation: 1, turn_id: `turn-${submitted.length}` }
+      }
+      if (path === '/session/stop') return { state: 'shell_ready', session_id: null, generation: 2 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) { return key === 'voiceTriggerThreshold' ? 'invalid' : fallback },
+      set(key, value) { writes.push([key, value]) }
+    },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({ cleanup: async () => {}, interrupt() {}, snapshot() { return {} } })
+  })
+
+  assert.equal(runtime.snapshot().noiseThreshold, 0.04)
+  await runtime.start()
+  onFrame(new Float32Array([0.91, 0.92]), 0.05)
+  assert.equal(runtime.snapshot().hasCurrentUtterance, true)
+
+  assert.equal(runtime.setNoiseThreshold(0.06), 0.06)
+  assert.equal(runtime.snapshot().noiseThreshold, 0.06)
+  assert.equal(runtime.snapshot().hasCurrentUtterance, false)
+  assert.deepEqual(writes.at(-1), ['voiceTriggerThreshold', 0.06])
+  assert.equal(await runtime.manualDone(), false)
+
+  onFrame(new Float32Array([0.31, 0.32]), 0.05)
+  assert.equal(await runtime.manualDone(), false)
+  onFrame(new Float32Array([0.71, 0.72]), 0.07)
+  assert.equal(await runtime.manualDone(), true)
+  assert.equal(submitted.length, 1)
+  assert.doesNotMatch(Array.from(submitted[0]).join(','), /0\.91|0\.92/)
+
+  assert.equal(runtime.setNoiseThreshold(-1), 0.005)
+  assert.equal(runtime.setNoiseThreshold(1), 0.1)
+  assert.equal(runtime.setNoiseThreshold(Number.NaN), 0.04)
+  assert.deepEqual(writes.slice(-3), [
+    ['voiceTriggerThreshold', 0.005],
+    ['voiceTriggerThreshold', 0.1],
+    ['voiceTriggerThreshold', 0.04]
+  ])
+  await runtime.dispose()
+})
+
+test('voice trigger threshold UI exposes the exact label and bounds', () => {
+  const renderer = createHookRenderer()
+  const { testApi } = loadPlugin({ react: renderer.react })
+  const runtime = {
+    snapshot: () => ({
+      state: 'shell_ready', active: false, muted: false, busy: false, serverBusy: false,
+      interactionMode: 'native', minicpmInputPrompt: '', systemPrompt: '', noiseThreshold: 0.04,
+      hasCurrentUtterance: false, bargeIn: false, silenceMs: 4_000, turns: [], metrics: {},
+      microphoneLevel: 0, errorMessage: '',
+      server: { configured: true, state: 'stopped', running: false, managed: false, message: 'Stopped.' }
+    }),
+    subscribe: () => () => {}, startServer() {}, stopServer() {}, start() {}, setMuted() {},
+    manualDone() {}, discardUtterance() {}, interrupt() {}, end() {}, setSilenceMs() {},
+    setNoiseThreshold() {}, setBargeIn() {}, setInteractionMode() {}, setSystemPromptFromUi() {},
+    setMinicpmInputPromptFromUi() {}
+  }
+  const page = expandControls(renderer, renderer.render(testApi.EnglishCoachPage, { runtime }))
+  const threshold = descendants(page).find(element => (
+    element.type === 'Input' && element.props?.type === 'range' && element.props?.max === 0.1
+  ))
+
+  assert.ok(threshold)
+  assert.match(elementText(descendants(page).find(element => element.props?.children?.includes?.(threshold))), /Voice trigger threshold: 0\.040/)
+  assert.deepEqual(
+    [threshold.props.min, threshold.props.max, threshold.props.step, threshold.props.value],
+    [0.005, 0.1, 0.005, 0.04]
+  )
+})
+
+test('Smart speech speed state, API, storage access, constants, and UI are absent', () => {
+  const { testApi } = loadPlugin()
+  const reads = []
+  const writes = []
+  const runtime = testApi.createVoiceRuntime({
+    rest: async () => ({}),
+    storage: {
+      get(key, fallback) { reads.push(key); return fallback },
+      set(key, value) { writes.push([key, value]) }
+    },
+    captureFactory: async () => ({ cleanup: async () => {} }),
+    playbackFactory: async () => ({ cleanup: async () => {}, interrupt() {}, snapshot() { return {} } })
+  })
+
+  const snapshot = runtime.snapshot()
+  assert.equal(Object.hasOwn(snapshot, 'playbackSpeed'), false)
+  assert.equal(Object.hasOwn(runtime, 'setPlaybackSpeed'), false)
+  assert.equal(reads.includes('smartPlaybackSpeed'), false)
+  assert.equal(writes.some(([key]) => key === 'smartPlaybackSpeed'), false)
+  assert.equal(Object.keys(testApi).some(key => key.includes('SMART_PLAYBACK_SPEED')), false)
+
+  const source = fs.readFileSync(PLUGIN_PATH, 'utf8')
+  assert.doesNotMatch(source, /Smart speech speed|smartPlaybackSpeed|SMART_PLAYBACK_SPEED|setPlaybackSpeed|playbackSpeed/)
 })
 
 test('VAD preserves a 2–3 second mid-sentence hesitation at 4000 ms', () => {
@@ -366,6 +509,79 @@ test('playback schedules chunks in arrival order and respects each sample rate',
   assert.deepEqual(context.buffers.map(buffer => buffer.sampleRate), [24_000, 16_000])
   assert.deepEqual(context.sources.map(source => source.starts[0]), [0.03, 1.03])
   assert.equal(playback.snapshot().queuedSeconds, 2)
+})
+
+test('playback uses generated PCM timing at the Web Audio 1.0 default', async () => {
+  const { testApi } = loadPlugin()
+  const context = new FakeAudioContext()
+  const playback = testApi.createPlaybackQueue(context, { maxQueuedSeconds: 3, maxQueuedBytes: 192_000 })
+  const first = new Float32Array(24_000).fill(0.25)
+  const second = new Float32Array(24_000).fill(-0.5)
+
+  assert.equal(playback.enqueue(first, 24_000), true)
+  assert.equal(playback.enqueue(second, 24_000), true)
+
+  assert.deepEqual(context.sources.map(source => source.playbackRate.value), [1, 1])
+  assert.deepEqual(context.sources.map(source => source.starts[0]), [0.03, 1.03])
+  assert.deepEqual(context.sources.map(source => source.offsets), [[0], [0]])
+  assert.deepEqual(context.buffers.map(buffer => buffer.copied), [Array.from(first), Array.from(second)])
+  assert.equal(playback.snapshot().queuedBytes, first.byteLength + second.byteLength)
+  assert.equal(playback.snapshot().queuedSeconds, 2)
+  assert.ok(Math.abs(playback.snapshot().nextTime - 2.03) < 1e-12)
+
+  let drained = false
+  void playback.whenDrained().then(() => { drained = true })
+  context.sources[0].onended()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(drained, false)
+  context.sources[1].onended()
+  await until(() => drained)
+  assert.equal(playback.snapshot().queuedSeconds, 0)
+})
+
+test('playback warmup plays bounded silence without consuming speech budgets and is interruptible', async () => {
+  const { testApi } = loadPlugin()
+  const context = new FakeAudioContext()
+  context.currentTime = 4
+  const playback = testApi.createPlaybackQueue(context, { maxQueuedSeconds: 1, maxQueuedBytes: 16 })
+
+  const warming = playback.warmup(24_000, 0.5)
+  assert.equal(context.buffers.length, 1)
+  assert.equal(context.buffers[0].length, 12_000)
+  assert.equal(context.buffers[0].sampleRate, 24_000)
+  assert.equal(context.buffers[0].copied, null)
+  assert.equal(context.buffers[0].data.every(sample => sample === 0), true)
+  assert.deepEqual(context.sources[0].starts, [4])
+  assert.deepEqual(context.sources[0].offsets, [0])
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(playback.snapshot())),
+    {
+      queuedSeconds: 0, queuedBytes: 0, nextTime: 4, sourceCount: 1, droppedChunks: 0,
+      maxQueuedSeconds: 1, maxQueuedBytes: 16, firstSourceLeadSeconds: 0.03,
+      warmupCount: 1, lastSpeechSamples: 0
+    }
+  )
+
+  let ended = false
+  void warming.then(() => { ended = true })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(ended, false)
+  context.sources[0].onended()
+  await warming
+  assert.equal(playback.snapshot().sourceCount, 0)
+
+  const interrupted = playback.warmup(24_000, 1)
+  playback.interrupt()
+  await interrupted
+  assert.equal(context.sources[1].stopped, 1)
+  assert.equal(playback.snapshot().sourceCount, 0)
+  assert.equal(playback.snapshot().queuedBytes, 0)
+  assert.equal(playback.snapshot().queuedSeconds, 0)
+  assert.equal(playback.snapshot().warmupCount, 2)
+
+  await assert.rejects(playback.warmup(24_000, -0.01), /warmup/)
+  await assert.rejects(playback.warmup(24_000, 1.01), /warmup/)
+  await assert.rejects(playback.warmup(0, 0.5), /sample rate/)
 })
 
 test('playback reapplies bounded first-source lead-in after drain and interrupt', () => {
@@ -583,12 +799,14 @@ test('runtime persists the exact user-owned model prompt across lifecycles and r
 })
 
 test('page and remount use the runtime prompt as the single authority', () => {
-  const { testApi } = loadPlugin()
+  const renderer = createHookRenderer()
+  const { testApi } = loadPlugin({ react: renderer.react })
   const firstMarker = '  PAGE MARKER\n exact  '
   const secondMarker = '\n  REMOUNT MARKER  \n'
   let systemPrompt = firstMarker
   const setValues = []
   const startArguments = []
+  let listener = null
   const runtime = {
     snapshot: () => ({
       state: 'shell_ready', active: false, muted: false, busy: false, serverBusy: false,
@@ -596,16 +814,20 @@ test('page and remount use the runtime prompt as the single authority', () => {
       metrics: {}, systemPrompt, errorMessage: '',
       server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
     }),
-    subscribe: () => () => {},
-    setSystemPrompt(value) { setValues.push(value); systemPrompt = value },
+    subscribe(callback) { listener = callback; callback(this.snapshot()); return () => { listener = null } },
+    setSystemPrompt(value) { setValues.push(value); systemPrompt = value; listener?.(this.snapshot()) },
     setSystemPromptFromUi(value) { this.setSystemPrompt(value) },
     async start(...args) { startArguments.push(args) },
     startServer() {}, stopServer() {}, setMuted() {}, manualDone() {}, interrupt() {}, end() {},
     setSilenceMs() {}, setBargeIn() {}
   }
-  const render = () => testApi.EnglishCoachPage({ runtime })
+  const render = () => renderer.render(testApi.EnglishCoachPage, { runtime })
 
-  const firstPage = render()
+  let firstPage = expandControls(renderer, render())
+  descendants(firstPage)
+    .find(element => element.props?.['aria-label'] === 'Prompt controls')
+    .props.children[0].props.children.at(-1).props.onClick()
+  firstPage = render()
   const firstTextarea = descendants(firstPage).find(element => element.type === 'Textarea')
   assert.equal(firstTextarea.props.value, firstMarker)
   assert.equal(firstTextarea.props.maxLength, 65_536)
@@ -627,7 +849,8 @@ test('page controls an oversized multibyte prompt change without replacing store
   const storedMarker = '  PREVIOUS MARKER  '
   const values = new Map([['userOwnedModelPrompt', storedMarker]])
   const writes = []
-  const { testApi } = loadPlugin()
+  const renderer = createHookRenderer()
+  const { testApi } = loadPlugin({ react: renderer.react })
   const runtime = testApi.createVoiceRuntime({
     rest: async () => ({}),
     storage: {
@@ -638,7 +861,11 @@ test('page controls an oversized multibyte prompt change without replacing store
     playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
   })
   const oversized = '界'.repeat(Math.floor(testApi.MAX_SYSTEM_PROMPT_BYTES / 3) + 1)
-  const page = testApi.EnglishCoachPage({ runtime })
+  let page = expandControls(renderer, renderer.render(testApi.EnglishCoachPage, { runtime }))
+  descendants(page)
+    .find(element => element.props?.['aria-label'] === 'Prompt controls')
+    .props.children[0].props.children.at(-1).props.onClick()
+  page = renderer.render()
   const textarea = descendants(page).find(element => element.type === 'Textarea')
 
   assert.doesNotThrow(() => textarea.props.onChange({ target: { value: oversized } }))
@@ -646,7 +873,7 @@ test('page controls an oversized multibyte prompt change without replacing store
   assert.equal(values.get('userOwnedModelPrompt'), storedMarker)
   assert.deepEqual(writes, [])
   assert.equal(runtime.snapshot().errorMessage, 'System prompt exceeds the maximum of 65,536 UTF-8 bytes.')
-  const rerendered = testApi.EnglishCoachPage({ runtime })
+  const rerendered = renderer.render()
   const alert = descendants(rerendered).find(element => element.props?.role === 'alert')
   assert.equal(elementText(alert), 'System prompt exceeds the maximum of 65,536 UTF-8 bytes.')
 })
@@ -793,10 +1020,33 @@ test('default playback factory closes context when resume or queue construction 
       await assert.rejects(testApi.defaultPlaybackFactory({
         AudioContextCtor,
         queueFactory: () => { if (failAt === 'queue') throw new Error(failAt); return {} }
-      }), new RegExp(failAt))
+      }), failAt === 'resume' ? /^Error: Audio playback is unavailable$/ : new RegExp(failAt))
       if (context) assert.equal(context.closes, 1)
     })
   }
+})
+
+test('default playback ensureRunning retries suspension and hides resume failure details', async () => {
+  const { testApi } = loadPlugin()
+  let context = null
+  function MutableContext() {
+    context = this
+    this.state = 'running'
+    this.close = async () => {}
+    this.resume = async () => { throw new Error('private device detail') }
+  }
+  const playback = await testApi.defaultPlaybackFactory({
+    AudioContextCtor: MutableContext,
+    queueFactory: () => ({ interrupt() {} })
+  })
+
+  context.state = 'suspended'
+  await assert.rejects(playback.ensureRunning(), error => {
+    assert.equal(error.message, 'Audio playback is unavailable')
+    assert.doesNotMatch(String(error), /private device detail/)
+    return true
+  })
+  await playback.cleanup()
 })
 
 test('pre-roll and playback queues are deterministically bounded', () => {
@@ -1548,6 +1798,136 @@ test('utterance accumulator caps at 60-second capacity without dropping its begi
   assert.deepEqual(JSON.parse(JSON.stringify(capture.snapshot())), { sampleCount: 5, maxSamples: 5, full: true })
 })
 
+test('Discard utterance clears only current unsent capture and is idempotent without backend effects', async () => {
+  const { testApi } = loadPlugin()
+  const paths = []
+  let onFrame = null
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      paths.push(path)
+      if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 4 }
+      if (path === '/smart/session/stop') return { state: 'stopped', session_id: null, generation: 5 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'understand this audio'
+        return fallback
+      },
+      set() {}
+    },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({ cleanup: async () => {}, interrupt() {}, snapshot() { return {} } })
+  })
+
+  await runtime.start()
+  onFrame(new Float32Array([0.4, 0.5]), 0.2)
+  const before = runtime.snapshot()
+  assert.equal(before.hasCurrentUtterance, true)
+
+  assert.equal(runtime.discardUtterance(), true)
+  assert.equal(runtime.discardUtterance(), false)
+  const after = runtime.snapshot()
+  assert.equal(after.active, true)
+  assert.equal(after.muted, false)
+  assert.equal(after.state, 'listening')
+  assert.equal(after.hasCurrentUtterance, false)
+  assert.deepEqual(JSON.parse(JSON.stringify(after.turns)), JSON.parse(JSON.stringify(before.turns)))
+  assert.equal(after.userTranscript, before.userTranscript)
+  assert.deepEqual(JSON.parse(JSON.stringify(after.server)), JSON.parse(JSON.stringify(before.server)))
+  assert.deepEqual(paths, ['/smart/session/start'])
+  await runtime.dispose()
+})
+
+test('Discard utterance wins queued auto-submit and manual-submit races while later speech submits normally', async t => {
+  const { testApi } = loadPlugin()
+  for (const mode of ['native', 'smart-minicpm']) {
+    for (const trigger of ['auto', 'manual']) {
+      await t.test(`${mode} ${trigger}`, async () => {
+        const turnPath = mode === 'smart-minicpm' ? '/smart/turn' : '/turn'
+        const startPath = mode === 'smart-minicpm' ? '/smart/session/start' : '/session/start'
+        const stopPath = mode === 'smart-minicpm' ? '/smart/session/stop' : '/session/stop'
+        const paths = []
+        let onFrame = null
+        let turnCalls = 0
+        const runtime = testApi.createVoiceRuntime({
+          rest: async path => {
+            paths.push(path)
+            if (path === startPath) return { state: 'listening', session_id: 's1', generation: 1 }
+            if (path === turnPath) {
+              turnCalls += 1
+              return mode === 'smart-minicpm'
+                ? {
+                    state: 'listening', session_id: 's1', generation: 1, turn_id: `turn-${turnCalls}`,
+                    user_text: 'new speech', assistant_text: 'answer', audio_base64: null,
+                    sample_rate: null, warning: 'MiniCPM native speech failed.'
+                  }
+                : { state: 'thinking', session_id: 's1', generation: 1, turn_id: `turn-${turnCalls}` }
+            }
+            if (path === stopPath) return { state: 'stopped', session_id: null, generation: 2 }
+            throw new Error(`unexpected path: ${path}`)
+          },
+          storage: {
+            get(key, fallback) {
+              if (key === 'voiceInteractionMode') return mode
+              if (key === 'minicpmInputUnderstandingPrompt') return 'input prompt'
+              return fallback
+            },
+            set() {}
+          },
+          captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+          playbackFactory: async () => ({ cleanup: async () => {}, interrupt() {}, snapshot() { return {} } })
+        })
+
+        await runtime.start()
+        onFrame(new Float32Array(160).fill(0.2), 0.2)
+        let queued = null
+        if (trigger === 'auto') onFrame(new Float32Array(64_000), 0)
+        else queued = runtime.manualDone()
+        assert.equal(runtime.discardUtterance(), true)
+        if (queued) assert.equal(await queued, false)
+        else await new Promise(resolve => setImmediate(resolve))
+        assert.equal(paths.filter(path => path === '/turn' || path === '/smart/turn').length, 0)
+        assert.deepEqual(JSON.parse(JSON.stringify(runtime.snapshot().turns)), [])
+
+        onFrame(new Float32Array(160).fill(0.2), 0.2)
+        assert.equal(await runtime.manualDone(), true)
+        assert.equal(paths.filter(path => path === turnPath).length, 1)
+        await runtime.dispose()
+      })
+    }
+  }
+})
+
+test('Discard utterance button has the exact label and strict enablement rules', () => {
+  const base = {
+    state: 'listening', active: true, muted: false, busy: false, serverBusy: false,
+    interactionMode: 'native', minicpmInputPrompt: '', systemPrompt: '', noiseThreshold: 0.04,
+    hasCurrentUtterance: true, bargeIn: false, silenceMs: 4_000, turns: [], metrics: {},
+    microphoneLevel: 0, errorMessage: '',
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const renderButton = override => {
+    const renderer = createHookRenderer()
+    const { testApi } = loadPlugin({ react: renderer.react })
+    const runtime = {
+      snapshot: () => ({ ...base, ...override }), subscribe: () => () => {},
+      startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {},
+      discardUtterance() {}, interrupt() {}, end() {}, setSilenceMs() {}, setNoiseThreshold() {},
+      setBargeIn() {}, setInteractionMode() {}, setSystemPromptFromUi() {}, setMinicpmInputPromptFromUi() {}
+    }
+    const page = expandControls(renderer, renderer.render(testApi.EnglishCoachPage, { runtime }))
+    return descendants(page).find(element => elementText(element) === 'Discard utterance')
+  }
+
+  assert.equal(renderButton({}).props.disabled, false)
+  assert.equal(renderButton({ active: false }).props.disabled, true)
+  assert.equal(renderButton({ muted: true }).props.disabled, true)
+  assert.equal(renderButton({ state: 'ready' }).props.disabled, true)
+  assert.equal(renderButton({ hasCurrentUtterance: false }).props.disabled, true)
+})
+
 test('voice runtime owns exact REST, interruption, event, fallback, and cleanup lifecycle', async () => {
   const { testApi } = loadPlugin()
   const log = []
@@ -2268,46 +2648,1344 @@ test('Stop Server releases active voice resources before requesting server stop'
   await runtime.dispose()
 })
 
-test('page-local server card and buttons apply server and voice disabled-state rules', () => {
-  const { testApi } = loadPlugin()
+test('Controls mount collapsed, hide configuration only, preserve runtime state, and reset on remount', () => {
+  const calls = []
+  const view = {
+    state: 'listening', active: true, muted: false, busy: false, serverBusy: false,
+    interactionMode: 'smart-minicpm', minicpmInputPrompt: 'input marker', systemPrompt: 'coach marker',
+    smartModelProvider: '', smartModelName: '', smartModelDraftProvider: '', smartModelDraftName: '',
+    smartModelAvailable: true, smartModelDraftAvailable: true, smartModelsLoading: false,
+    smartModelsCatalog: { current: { provider: 'current', model: 'current-model' }, providers: [] },
+    bargeIn: false, silenceMs: 4_000, noiseThreshold: 0.04, hasCurrentUtterance: true,
+    assistantText: 'visible answer', userTranscript: 'visible user',
+    turns: [{ id: 'turn-1', userText: 'visible user', assistantText: 'visible answer', complete: true }],
+    microphoneLevel: 0.25, metrics: { total_ms: 1 }, errorMessage: 'visible error',
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const mount = () => {
+    const renderer = createHookRenderer()
+    const { testApi } = loadPlugin({ react: renderer.react })
+    const runtime = {
+      snapshot: () => view,
+      subscribe(listener) { listener(view); return () => {} },
+      loadSmartModels() { return Promise.resolve() },
+      startServer() { calls.push('startServer') }, stopServer() { calls.push('stopServer') },
+      start() { calls.push('start') }, setMuted() { calls.push('mute') }, manualDone() { calls.push('done') },
+      discardUtterance() { calls.push('discard') }, interrupt() { calls.push('interrupt') },
+      end() { calls.push('end') }, clearChat() { calls.push('clear') },
+      setSilenceMs() { calls.push('silence') }, setNoiseThreshold() { calls.push('noise') },
+      setBargeIn() { calls.push('barge') }, setInteractionMode() { calls.push('mode') },
+      setSystemPromptFromUi() { calls.push('coach') }, setMinicpmInputPromptFromUi() { calls.push('input') },
+      setSmartModelProviderDraft() { calls.push('provider') }, setSmartModelNameDraft() { calls.push('model') },
+      saveSmartModel() { calls.push('save') }
+    }
+    const render = () => renderer.render(testApi.EnglishCoachPage, { runtime })
+    return { renderer, runtime, render, page: render() }
+  }
+  const hiddenControlTypes = page => descendants(page).filter(element => (
+    ['Switch', 'Textarea', 'select'].includes(element.type) ||
+    (element.type === 'Input' && element.props?.type === 'range')
+  ))
+  const actionLabels = [
+    'Start Server', 'Stop Server', 'Save model', 'Refresh models', 'Manage providers',
+    'Start', 'Mute', "I'm done", 'Discard utterance', 'Interrupt', 'End', 'Clear chat'
+  ]
+
+  const mounted = mount()
+  const before = JSON.parse(JSON.stringify(mounted.runtime.snapshot()))
+  const collapsed = mounted.page
+  assert.match(elementText(controlSection(collapsed)), /Controls.*Smart mode.*Details/)
+  assert.equal(controlToggle(collapsed).props['aria-expanded'], false)
+  assert.deepEqual(hiddenControlTypes(collapsed), [])
+  assert.deepEqual(
+    descendants(collapsed).filter(element => element.type === 'Button').map(elementText),
+    ['Details']
+  )
+  for (const label of actionLabels) assert.doesNotMatch(elementText(collapsed), new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  assert.match(elementText(collapsed), /visible user.*visible answer/)
+  assert.ok(descendants(collapsed).find(element => element.props?.['aria-label'] === 'Microphone level'))
+  assert.ok(descendants(collapsed).find(element => element.props?.['aria-label'] === 'Conversation history'))
+  assert.ok(descendants(collapsed).find(element => element.props?.['aria-label'] === 'Timing metrics'))
+  assert.equal(elementText(descendants(collapsed).find(element => element.props?.role === 'alert')), 'visible error')
+
+  let expanded = expandControls(mounted.renderer, collapsed)
+  assert.equal(controlToggle(expanded).props.children, 'Hide')
+  assert.equal(controlToggle(expanded).props['aria-expanded'], true)
+  assert.ok(descendants(expanded).some(element => element.type === 'Switch'))
+  assert.equal(descendants(expanded).filter(element => element.type === 'select').length, 2)
+  assert.equal(descendants(expanded).filter(element => element.type === 'Input' && element.props?.type === 'range').length, 2)
+  for (const label of actionLabels.slice(4)) assert.match(elementText(expanded), new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  assert.ok(descendants(expanded).find(element => element.props?.['aria-label'] === 'Local MiniCPM server controls'))
+  assert.ok(descendants(expanded).find(element => element.props?.['aria-label'] === 'Prompt controls'))
+
+  controlToggle(expanded).props.onClick()
+  const hiddenAgain = mounted.render()
+  assert.equal(controlToggle(hiddenAgain).props.children, 'Details')
+  assert.deepEqual(hiddenControlTypes(hiddenAgain), [])
+  assert.deepEqual(JSON.parse(JSON.stringify(mounted.runtime.snapshot())), before)
+  assert.deepEqual(calls, [])
+
+  const remounted = mount()
+  assert.equal(controlToggle(remounted.page).props['aria-expanded'], false)
+  assert.deepEqual(hiddenControlTypes(remounted.page), [])
+})
+
+test('page-local server controls mount compact and reveal existing details on demand', () => {
   const base = {
     state: 'shell_ready', active: false, muted: false, busy: false, serverBusy: false,
     bargeIn: false, silenceMs: 4_000, assistantText: '', userTranscript: '', microphoneLevel: 0,
     metrics: {}, errorMessage: ''
   }
-  const render = server => testApi.EnglishCoachPage({
-    runtime: {
+  const mount = server => {
+    const renderer = createHookRenderer()
+    const { testApi } = loadPlugin({ react: renderer.react })
+    const runtime = {
       snapshot: () => ({ ...base, server }),
-      subscribe: () => () => {},
+      subscribe(listener) { listener(this.snapshot()); return () => {} },
       startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {}, interrupt() {}, end() {},
       setSilenceMs() {}, setBargeIn() {}
     }
-  })
+    const render = () => renderer.render(testApi.EnglishCoachPage, { runtime })
+    const page = expandControls(renderer, render())
+    return { renderer, render, page }
+  }
+  const serverSection = page => descendants(page)
+    .find(element => element.props?.['aria-label'] === 'Local MiniCPM server controls')
   const buttons = page => Object.fromEntries(
     descendants(page)
       .filter(element => element.type === 'Button')
       .map(element => [elementText(element), element.props])
   )
 
-  const stopped = render({ configured: true, state: 'stopped', running: false, managed: false, message: 'Stopped.' })
-  assert.match(elementText(stopped), /Server: stopped/)
-  assert.match(elementText(stopped), /Stopped\./)
+  const stoppedMount = mount({ configured: true, state: 'stopped', running: false, managed: false, message: 'Stopped.' })
+  const collapsed = serverSection(stoppedMount.page)
+  assert.match(elementText(collapsed), /Server.*stopped.*Details/)
+  assert.doesNotMatch(elementText(collapsed), /Stopped\.|Start Server|Stop Server/)
+  assert.equal(buttons(collapsed).Details['aria-expanded'], false)
+  assert.equal(collapsed.props.style?.padding, undefined)
+  assert.equal(collapsed.props.style?.border, undefined)
+
+  buttons(collapsed).Details.onClick()
+  const stopped = stoppedMount.render()
+  assert.match(elementText(serverSection(stopped)), /Stopped\./)
   assert.equal(buttons(stopped)['Start Server'].disabled, false)
   assert.equal(buttons(stopped)['Stop Server'].disabled, true)
+  assert.equal(buttons(serverSection(stopped)).Details['aria-expanded'], true)
   assert.equal(buttons(stopped).Start.disabled, true)
 
-  const ready = render({ configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' })
+  const readyMount = mount({ configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' })
+  buttons(serverSection(readyMount.page)).Details.onClick()
+  const ready = readyMount.render()
   assert.equal(buttons(ready)['Start Server'].disabled, true)
   assert.equal(buttons(ready)['Stop Server'].disabled, false)
   assert.equal(buttons(ready).Start.disabled, false)
 
-  const external = render({ configured: true, state: 'external', running: true, managed: false, message: 'External.' })
+  const externalMount = mount({ configured: true, state: 'external', running: true, managed: false, message: 'External.' })
+  buttons(serverSection(externalMount.page)).Details.onClick()
+  const external = externalMount.render()
   assert.equal(buttons(external)['Start Server'].disabled, true)
   assert.equal(buttons(external)['Stop Server'].disabled, true)
   assert.equal(buttons(external).Start.disabled, false)
+
+  const remounted = mount({ configured: true, state: 'stopped', running: false, managed: false, message: 'Stopped.' })
+  assert.equal(buttons(serverSection(remounted.page)).Details['aria-expanded'], false)
 })
 
 test('server controls introduce no bottom status-bar source token', () => {
   const source = fs.readFileSync(PLUGIN_PATH, 'utf8')
   assert.doesNotMatch(source, /statusBar\.|STATUSBAR|STATUS_BAR/)
+})
+
+test('page-local prompt editors mount collapsed and preserve exact fields when expanded', () => {
+  const changes = []
+  const mount = () => {
+    const renderer = createHookRenderer()
+    const { testApi } = loadPlugin({ react: renderer.react })
+    const runtime = {
+      snapshot: () => ({
+        state: 'shell_ready', active: false, muted: false, busy: false, serverBusy: false,
+        interactionMode: 'smart-minicpm', minicpmInputPrompt: 'input marker', systemPrompt: '',
+        noiseThreshold: 0.04, hasCurrentUtterance: false, bargeIn: false, silenceMs: 4_000,
+        turns: [], microphoneLevel: 0, metrics: {}, errorMessage: '',
+        server: { configured: true, state: 'stopped', running: false, managed: false, message: 'Stopped.' }
+      }),
+      subscribe(listener) { listener(this.snapshot()); return () => {} },
+      startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {},
+      discardUtterance() {}, interrupt() {}, end() {}, setSilenceMs() {}, setNoiseThreshold() {},
+      setBargeIn() {}, setInteractionMode() {},
+      setSystemPromptFromUi(value) { changes.push(['coach', value]) },
+      setMinicpmInputPromptFromUi(value) { changes.push(['minicpm', value]) }
+    }
+    const render = () => renderer.render(testApi.EnglishCoachPage, { runtime })
+    const page = expandControls(renderer, render())
+    return { renderer, render, page }
+  }
+  const promptSection = page => descendants(page)
+    .find(element => element.props?.['aria-label'] === 'Prompt controls')
+  const detailsButton = section => descendants(section)
+    .find(element => element.type === 'Button' && ['Details', 'Hide'].includes(elementText(element)))
+
+  const mounted = mount()
+  const collapsed = promptSection(mounted.page)
+  assert.ok(collapsed)
+  assert.match(elementText(collapsed), /Prompts.*MiniCPM set.*Coach unset.*Details/)
+  assert.doesNotMatch(elementText(collapsed), /MiniCPM input-understanding prompt|GPT\/Coach model prompt/)
+  assert.equal(descendants(collapsed).filter(element => element.type === 'Textarea').length, 0)
+  assert.equal(detailsButton(collapsed).props['aria-expanded'], false)
+
+  detailsButton(collapsed).props.onClick()
+  const expanded = promptSection(mounted.render())
+  assert.match(elementText(expanded), /MiniCPM input-understanding prompt \(required for Smart Start\)/)
+  assert.match(elementText(expanded), /GPT\/Coach model prompt \(optional; applies on the next session\)/)
+  assert.equal(detailsButton(expanded).props.children, 'Hide')
+  assert.equal(detailsButton(expanded).props['aria-expanded'], true)
+  const fields = descendants(expanded).filter(element => element.type === 'Textarea')
+  assert.equal(fields.length, 2)
+  assert.deepEqual(fields.map(field => [field.props['aria-label'], field.props.maxLength]), [
+    ['User-owned model prompt', 65_536],
+    ['MiniCPM input-understanding prompt', 65_536]
+  ])
+  fields[0].props.onChange({ target: { value: 'exact coach change' } })
+  fields[1].props.onChange({ target: { value: 'exact input change' } })
+  assert.deepEqual(changes, [
+    ['coach', 'exact coach change'],
+    ['minicpm', 'exact input change']
+  ])
+
+  const remounted = mount()
+  assert.equal(detailsButton(promptSection(remounted.page)).props['aria-expanded'], false)
+  assert.equal(descendants(promptSection(remounted.page)).filter(element => element.type === 'Textarea').length, 0)
+})
+
+test('Smart mode is opt-in persisted inactive-only with an independent input prompt', async () => {
+  const { testApi } = loadPlugin()
+  const values = new Map()
+  const writes = []
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 1 }
+      if (path === '/smart/session/stop') return { state: 'stopped', session_id: null, generation: 2 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) { return values.has(key) ? values.get(key) : fallback },
+      set(key, value) { values.set(key, value); writes.push([key, value]) }
+    },
+    captureFactory: async () => ({ cleanup: async () => {} }),
+    playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+
+  assert.equal(runtime.snapshot().interactionMode, 'native')
+  assert.equal(runtime.snapshot().minicpmInputPrompt, '')
+  assert.equal(runtime.setInteractionMode('smart-minicpm'), true)
+  runtime.setMinicpmInputPrompt('  exact input marker  ')
+  runtime.setSystemPrompt('  exact GPT marker  ')
+  assert.equal(runtime.snapshot().interactionMode, 'smart-minicpm')
+  assert.equal(runtime.snapshot().minicpmInputPrompt, '  exact input marker  ')
+  assert.deepEqual(writes.slice(-3), [
+    ['voiceInteractionMode', 'smart-minicpm'],
+    ['minicpmInputUnderstandingPrompt', '  exact input marker  '],
+    ['userOwnedModelPrompt', '  exact GPT marker  ']
+  ])
+
+  await runtime.start()
+  assert.equal(runtime.setInteractionMode('native'), false)
+  assert.equal(runtime.snapshot().interactionMode, 'smart-minicpm')
+  await runtime.end()
+  assert.equal(runtime.setInteractionMode('native'), true)
+  await runtime.dispose()
+})
+
+test('Smart start request requires user-owned MiniCPM input instructions and preserves both prompts', () => {
+  const { testApi } = loadPlugin()
+  assert.throws(() => testApi.buildSmartSessionStartRequest('', ' \n\t '), /MiniCPM input instructions are required/)
+  const request = testApi.buildSmartSessionStartRequest('  GPT MARKER  ', '  INPUT MARKER  ')
+  assert.deepEqual(JSON.parse(JSON.stringify(request)), {
+    path: '/smart/session/start',
+    options: {
+      method: 'POST',
+      body: {
+        gpt_system_prompt: '  GPT MARKER  ',
+        minicpm_input_prompt: '  INPUT MARKER  ',
+        model_provider: '',
+        model_name: ''
+      },
+      timeoutMs: 210_000
+    }
+  })
+})
+
+test('Smart model draft saves exact pairs and only new sessions use the saved selection', async () => {
+  const { testApi } = loadPlugin()
+  const values = new Map([
+    ['voiceInteractionMode', 'smart-minicpm'],
+    ['minicpmInputUnderstandingPrompt', 'input'],
+    ['smartModelProvider', 'openrouter'],
+    ['smartModelName', 'lab/old']
+  ])
+  const writes = []
+  const calls = []
+  const catalog = {
+    current: { provider: 'current', model: 'current-model' },
+    providers: [{ provider: 'openrouter', label: 'OpenRouter', models: ['lab/new', 'lab/old'] }]
+  }
+  const runtime = testApi.createVoiceRuntime({
+    rest: async (path, options) => {
+      calls.push({ path, options })
+      if (path === '/smart/models') return catalog
+      if (path === '/smart/models?refresh=true') return catalog
+      if (path === '/smart/session/start') return { state: 'listening', session_id: `smart-${calls.length}`, generation: calls.length }
+      if (path === '/smart/session/stop') return { state: 'stopped', session_id: null, generation: calls.length }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) { return values.has(key) ? values.get(key) : fallback },
+      set(key, value) { values.set(key, value); writes.push([key, value]) }
+    },
+    captureFactory: async () => ({ cleanup: async () => {} }),
+    playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+
+  await runtime.loadSmartModels(false)
+  assert.equal(runtime.snapshot().smartModelAvailable, true)
+  runtime.setSmartModelNameDraft('lab/new')
+  assert.equal(runtime.snapshot().smartModelName, 'lab/old')
+  assert.equal(runtime.snapshot().smartModelDraftName, 'lab/new')
+  assert.deepEqual(writes, [])
+
+  await runtime.start()
+  assert.equal(runtime.saveSmartModel(), false)
+  const firstStart = calls.find(call => call.path === '/smart/session/start')
+  assert.deepEqual(JSON.parse(JSON.stringify(firstStart.options.body)), {
+    gpt_system_prompt: '', minicpm_input_prompt: 'input',
+    model_provider: 'openrouter', model_name: 'lab/old'
+  })
+  await runtime.end()
+
+  assert.equal(runtime.saveSmartModel(), true)
+  assert.deepEqual(writes, [
+    ['smartModelProvider', 'openrouter'],
+    ['smartModelName', 'lab/new']
+  ])
+  await runtime.start()
+  const starts = calls.filter(call => call.path === '/smart/session/start')
+  assert.equal(starts.length, 2)
+  assert.equal(starts[1].options.body.model_provider, 'openrouter')
+  assert.equal(starts[1].options.body.model_name, 'lab/new')
+  await runtime.end()
+
+  await runtime.loadSmartModels(true)
+  assert.deepEqual(calls.filter(call => call.path.startsWith('/smart/models')).map(call => call.path), [
+    '/smart/models', '/smart/models?refresh=true'
+  ])
+  await runtime.dispose()
+})
+
+test('disappeared Smart model stays visible as unavailable and blocks Start until explicit valid save', async () => {
+  const { testApi } = loadPlugin()
+  const paths = []
+  const writes = []
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      paths.push(path)
+      if (path === '/smart/models') return {
+        current: { provider: 'current', model: 'current-model' },
+        providers: [{ provider: 'openrouter', label: 'OpenRouter', models: ['lab/available'] }]
+      }
+      if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 1 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'input'
+        if (key === 'smartModelProvider') return 'openrouter'
+        if (key === 'smartModelName') return 'lab/gone'
+        return fallback
+      },
+      set(key, value) { writes.push([key, value]) }
+    },
+    captureFactory: async () => ({ cleanup: async () => {} }),
+    playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+
+  await runtime.loadSmartModels()
+  const unavailable = runtime.snapshot()
+  assert.equal(unavailable.smartModelProvider, 'openrouter')
+  assert.equal(unavailable.smartModelName, 'lab/gone')
+  assert.equal(unavailable.smartModelAvailable, false)
+  await assert.rejects(runtime.start(), /Model selection is unavailable/)
+  assert.equal(paths.includes('/smart/session/start'), false)
+
+  runtime.setSmartModelProviderDraft('')
+  assert.equal(runtime.saveSmartModel(), true)
+  assert.deepEqual(writes, [['smartModelProvider', ''], ['smartModelName', '']])
+  await runtime.start()
+  assert.equal(paths.includes('/smart/session/start'), true)
+  await runtime.dispose()
+})
+
+test('Smart model controls are independent, refresh the catalog, and deep-link provider settings', () => {
+  const navigations = []
+  const calls = []
+  const renderer = createHookRenderer()
+  const { testApi } = loadPlugin({ react: renderer.react,
+    sdk: {
+      Badge: 'Badge', Button: 'Button', Codicon: 'Codicon', Input: 'Input',
+      PALETTE_AREA: 'palette', ROUTES_AREA: 'routes', SIDEBAR_NAV_AREA: 'sidebar.nav',
+      Switch: 'Switch', Textarea: 'Textarea', host: { navigate(path) { navigations.push(path) } }
+    }
+  })
+  const view = {
+    state: 'shell_ready', active: false, muted: false, busy: false, serverBusy: false,
+    interactionMode: 'smart-minicpm', minicpmInputPrompt: 'input', systemPrompt: '',
+    smartModelProvider: 'openrouter', smartModelName: 'lab/gone',
+    smartModelDraftProvider: 'openrouter', smartModelDraftName: 'lab/gone',
+    smartModelAvailable: false, smartModelDraftAvailable: false, smartModelsLoading: false,
+    smartModelsCatalog: {
+      current: { provider: 'current', model: 'current-model' },
+      providers: [{ provider: 'openrouter', label: 'OpenRouter', models: ['lab/available'] }]
+    },
+    bargeIn: false, silenceMs: 4_000, noiseThreshold: 0.04, turns: [], microphoneLevel: 0,
+    metrics: {}, errorMessage: '', hasCurrentUtterance: false,
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const runtime = {
+    snapshot: () => view, subscribe: () => () => {},
+    loadSmartModels(refresh) { calls.push(['load', refresh]); return Promise.resolve() },
+    setSmartModelProviderDraft(value) { calls.push(['provider', value]) },
+    setSmartModelNameDraft(value) { calls.push(['model', value]) },
+    saveSmartModel() { calls.push(['save']) },
+    startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {}, discardUtterance() {},
+    interrupt() {}, end() {}, clearChat() {}, setSilenceMs() {}, setNoiseThreshold() {}, setBargeIn() {},
+    setInteractionMode() {}, setSystemPromptFromUi() {}, setMinicpmInputPromptFromUi() {}
+  }
+
+  const page = expandControls(renderer, renderer.render(testApi.EnglishCoachPage, { runtime }))
+  const modelSection = descendants(page).find(element => element.props?.['aria-label'] === 'Smart model controls')
+  const promptSection = descendants(page).find(element => element.props?.['aria-label'] === 'Prompt controls')
+  assert.ok(modelSection)
+  assert.ok(promptSection)
+  assert.match(elementText(modelSection), /Smart model.*Current Hermes model.*lab\/gone.*unavailable/)
+  assert.doesNotMatch(elementText(promptSection), /Smart model/)
+  const selects = descendants(modelSection).filter(element => element.type === 'select')
+  assert.equal(selects.length, 2)
+  assert.equal(selects[0].props.value, 'openrouter')
+  assert.equal(selects[1].props.value, 'lab/gone')
+  const buttons = Object.fromEntries(
+    descendants(modelSection).filter(element => element.type === 'Button')
+      .map(button => [elementText(button), button])
+  )
+  assert.equal(buttons['Save model'].props.disabled, true)
+  buttons['Refresh models'].props.onClick()
+  buttons['Manage providers'].props.onClick()
+  assert.deepEqual(calls, [['load', false], ['load', true]])
+  assert.deepEqual(navigations, ['/settings?tab=config:model'])
+})
+
+test('Smart model picker exposes no credential surface and documents exact plugin trust', () => {
+  const desktop = fs.readFileSync(PLUGIN_PATH, 'utf8')
+  assert.doesNotMatch(
+    desktop,
+    /api[_ -]?key|key_env|base_url|oauth|credential|password|secret placeholder/i
+  )
+  const pluginRoot = path.join(__dirname, '..')
+  const docs = ['README.md', 'ARCHITECTURE.md', 'MAINTENANCE.md']
+    .map(name => fs.readFileSync(path.join(pluginRoot, name), 'utf8'))
+    .join('\n')
+  for (const required of [
+    'allow_provider_override: true',
+    'allow_model_override: true',
+    'allowed_providers: ["*"]',
+    'allowed_models: ["*"]',
+    'validated against the central authenticated inventory'
+  ]) assert.match(docs, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+})
+
+test('Smart turn maps interpretation and answer then stays speaking until 24 kHz playback drains', async () => {
+  const { testApi } = loadPlugin()
+  let onFrame = null
+  const drain = deferred()
+  const turnResponse = deferred()
+  const calls = []
+  const enqueued = []
+  let playbackPending = false
+  const runtime = testApi.createVoiceRuntime({
+    rest: async (path, options) => {
+      calls.push({ path, options })
+      if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 7 }
+      if (path === '/smart/turn') return turnResponse.promise
+      if (path === '/smart/session/stop') return { state: 'stopped', session_id: null, generation: 8 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'input instructions'
+        return fallback
+      },
+      set() {}
+    },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({
+      enqueue(samples, rate, playbackRate) {
+        playbackPending = true
+        enqueued.push([samples.length, rate, playbackRate])
+        return true
+      },
+      interrupt() { playbackPending = false },
+      whenDrained() { return drain.promise },
+      snapshot() { return playbackPending ? { sourceCount: 1, queuedBytes: 4, queuedSeconds: 1 / 24_000 } : {} },
+      cleanup: async () => {}
+    })
+  })
+
+  await runtime.start()
+  assert.deepEqual(calls.map(call => call.path), ['/smart/session/start'])
+  onFrame(new Float32Array(1_600).fill(0.2), 0.2)
+  const submitting = runtime.manualDone()
+  await until(() => calls.some(call => call.path === '/smart/turn'))
+
+  const pending = runtime.snapshot()
+  assert.equal(pending.state, 'thinking')
+  assert.deepEqual(JSON.parse(JSON.stringify(pending.turns)), [{
+    id: 'local-1', userText: 'Interpreting audio...', userTextPending: true,
+    assistantText: '', complete: false
+  }])
+  assert.equal(pending.userTranscript, 'Interpreting audio...')
+  assert.doesNotMatch(JSON.stringify(pending.turns), /Native audio/)
+  const pendingPage = testApi.EnglishCoachPage({ runtime: {
+    snapshot: () => pending, subscribe: () => () => {}, startServer() {}, stopServer() {}, start() {},
+    setMuted() {}, manualDone() {}, interrupt() {}, end() {}, setSilenceMs() {}, setBargeIn() {},
+    setInteractionMode() {}, setSystemPromptFromUi() {}, setMinicpmInputPromptFromUi() {}
+  } })
+  const pendingHistory = descendants(pendingPage)
+    .find(element => element.props?.['aria-label'] === 'Conversation history')
+  const pendingBubbles = descendants(pendingHistory)
+    .filter(element => element.props?.['data-bubble-side'])
+  assert.equal(pendingBubbles.length, 2)
+  assert.deepEqual(
+    [pendingBubbles[0].props['data-bubble-side'], elementText(pendingBubbles[0])],
+    ['right', 'Interpreting audio...']
+  )
+  assert.equal(pendingBubbles[0].props.role, 'status')
+  assert.equal(pendingBubbles[0].props['data-user-text-pending'], true)
+  assert.equal(pendingBubbles[0].props.style.color, 'var(--ui-text-secondary)')
+  assert.match(pendingBubbles[0].props['aria-label'], /interpretation status/i)
+  assert.deepEqual(pendingBubbles.map(element => [
+    element.props['data-bubble-side'], elementText(element)
+  ]), [['right', 'Interpreting audio...'], ['left', 'Thinking…']])
+
+  turnResponse.resolve({
+    state: 'listening', session_id: 'smart-1', generation: 7, turn_id: 'smart-turn-1',
+    user_text: 'MiniCPM interpretation', assistant_text: 'Exact GPT answer',
+    audio_base64: 'AAAAAA==', sample_rate: 24_000, warning: null
+  })
+  await submitting
+
+  const speaking = runtime.snapshot()
+  assert.deepEqual(enqueued, [[1, 24_000, 1.0]])
+  assert.equal(speaking.state, 'speaking')
+  assert.deepEqual(JSON.parse(JSON.stringify(speaking.turns)), [{
+    id: 'smart-turn-1', userText: 'MiniCPM interpretation',
+    assistantText: 'Exact GPT answer', complete: true
+  }])
+  const speakingPage = testApi.EnglishCoachPage({ runtime: {
+    snapshot: () => speaking, subscribe: () => () => {}, startServer() {}, stopServer() {}, start() {},
+    setMuted() {}, manualDone() {}, interrupt() {}, end() {}, setSilenceMs() {}, setBargeIn() {},
+    setInteractionMode() {}, setSystemPromptFromUi() {}, setMinicpmInputPromptFromUi() {}
+  } })
+  const speakingHistory = descendants(speakingPage)
+    .find(element => element.props?.['aria-label'] === 'Conversation history')
+  const speakingBubbles = descendants(speakingHistory)
+    .filter(element => element.props?.['data-bubble-side'])
+  assert.deepEqual(speakingBubbles.map(element => [
+    element.props['data-bubble-side'], elementText(element)
+  ]), [
+    ['right', 'MiniCPM interpretation'],
+    ['left', 'Exact GPT answer']
+  ])
+  assert.doesNotMatch(JSON.stringify(calls), /Interpreting audio\.\.\./)
+  playbackPending = false
+  drain.resolve()
+  await until(() => runtime.snapshot().state === 'listening')
+  await runtime.end()
+  assert.equal(calls.at(-1).path, '/smart/session/stop')
+  assert.equal(runtime.snapshot().turns.length, 1)
+  await runtime.dispose()
+})
+
+test('Smart user text deltas fill the pending right bubble and authoritative text replaces them', async () => {
+  const { testApi } = loadPlugin()
+  let onFrame = null
+  let socketHandler = null
+  const turnResponse = deferred()
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 7 }
+      if (path === '/smart/turn') return turnResponse.promise
+      if (path === '/smart/session/stop') return { state: 'stopped', session_id: null, generation: 8 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'input'
+        return fallback
+      }, set() {}
+    },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+  runtime.bindSocket((_path, handler) => { socketHandler = handler; return () => {} })
+  await runtime.start()
+  onFrame(new Float32Array(16).fill(0.2), 0.2)
+  const submitting = runtime.manualDone()
+  await until(() => runtime.snapshot().state === 'thinking')
+
+  const valid = {
+    type: 'smart.user_text.delta', session_id: 'smart-1', generation: 7,
+    turn_id: 'smart-turn-1', text: 'Immediate '
+  }
+  socketHandler({ ...valid, generation: 6, text: 'stale generation' })
+  socketHandler({ ...valid, turn_id: '', text: 'invalid id' })
+  socketHandler({ ...valid, text: '' })
+  socketHandler({ ...valid, text: 'x'.repeat(65_537) })
+  socketHandler({ ...valid, model: 'must-not-be-accepted' })
+  assert.equal(runtime.snapshot().turns[0].userText, 'Interpreting audio...')
+  assert.equal(runtime.snapshot().turns[0].userTextPending, true)
+
+  socketHandler(valid)
+  socketHandler(valid)
+  socketHandler({ ...valid, text: 'MiniCPM interpretation' })
+  const immediate = runtime.snapshot()
+  assert.deepEqual(JSON.parse(JSON.stringify(immediate.turns)), [{
+    id: 'smart-turn-1', userText: 'Immediate MiniCPM interpretation',
+    assistantText: '', complete: false
+  }])
+  assert.equal(immediate.turns[0].userTextPending, undefined)
+  assert.equal(immediate.userTranscript, 'Immediate MiniCPM interpretation')
+
+  const immediatePage = testApi.EnglishCoachPage({ runtime: {
+    snapshot: () => immediate, subscribe: () => () => {}, startServer() {}, stopServer() {}, start() {},
+    setMuted() {}, manualDone() {}, interrupt() {}, end() {}, setSilenceMs() {}, setBargeIn() {},
+    setInteractionMode() {}, setSystemPromptFromUi() {}, setMinicpmInputPromptFromUi() {}
+  } })
+  const history = descendants(immediatePage)
+    .find(element => element.props?.['aria-label'] === 'Conversation history')
+  assert.deepEqual(
+    descendants(history)
+      .filter(element => element.props?.['data-bubble-side'])
+      .map(element => [element.props['data-bubble-side'], elementText(element)]),
+    [['right', 'Immediate MiniCPM interpretation'], ['left', 'Thinking…']]
+  )
+
+  socketHandler({
+    type: 'smart.user_text', session_id: 'smart-1', generation: 7,
+    turn_id: 'smart-turn-1', text: 'Authoritative event interpretation'
+  })
+  assert.equal(runtime.snapshot().turns[0].userText, 'Authoritative event interpretation')
+  assert.equal(runtime.snapshot().turns[0].userTextPending, undefined)
+
+  turnResponse.resolve({
+    state: 'listening', session_id: 'smart-1', generation: 7, turn_id: 'smart-turn-1',
+    user_text: 'Authoritative HTTP interpretation', assistant_text: 'Exact coach answer',
+    audio_base64: null, sample_rate: null, warning: 'MiniCPM native speech failed.'
+  })
+  await submitting
+  socketHandler({ ...valid, text: 'late replacement' })
+
+  assert.deepEqual(JSON.parse(JSON.stringify(runtime.snapshot().turns)), [{
+    id: 'smart-turn-1', userText: 'Authoritative HTTP interpretation',
+    assistantText: 'Exact coach answer', complete: true
+  }])
+  assert.equal(runtime.snapshot().turns[0].userTextPending, undefined)
+  await runtime.dispose()
+})
+
+test('Smart sequential responses warm the sink then enqueue fresh PCM at rate 1.0 with exact queue timing', async () => {
+  const { testApi } = loadPlugin()
+  let context = null
+  let onFrame = null
+  let turnNumber = 0
+  const payloads = [
+    new Float32Array([0.11, 0.12, 0.13]),
+    new Float32Array([0.21, 0.22, 0.23, 0.24]),
+    new Float32Array([0.31, 0.32, 0.33, 0.34, 0.35])
+  ]
+  const encoded = payloads.map(samples => Buffer.from(testApi.float32ToBytes(samples)).toString('base64'))
+
+  class MutableAudioContext extends FakeAudioContext {
+    constructor() {
+      super()
+      context = this
+      this.state = 'suspended'
+      this.resumeCalls = 0
+      this.closeCalls = 0
+    }
+
+    async resume() {
+      this.resumeCalls += 1
+      this.state = 'running'
+    }
+
+    async close() { this.closeCalls += 1 }
+  }
+
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 2 }
+      if (path === '/smart/turn') {
+        const index = turnNumber++
+        return {
+          state: 'listening', session_id: 'smart-1', generation: 2, turn_id: `turn-${index + 1}`,
+          user_text: `user ${index + 1}`, assistant_text: `answer ${index + 1}`,
+          audio_base64: encoded[index], sample_rate: 24_000, warning: null
+        }
+      }
+      if (path === '/smart/session/stop') return { state: 'stopped', session_id: null, generation: 3 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'input'
+        return fallback
+      }, set() {}
+    },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: () => testApi.defaultPlaybackFactory({ AudioContextCtor: MutableAudioContext })
+  })
+
+  await runtime.start()
+  assert.equal(context.state, 'running')
+  assert.equal(context.resumeCalls, 1)
+
+  for (let index = 0; index < payloads.length; index += 1) {
+    if (index > 0) {
+      context.state = 'suspended'
+      context.currentTime = index * 10
+    }
+    onFrame(new Float32Array(16).fill(0.2), 0.2)
+    const submitting = runtime.manualDone()
+    await until(
+      () => context.sources.length === index * 2 + 1,
+      `turn ${index + 1} did not start sink warmup`
+    )
+
+    assert.equal(context.state, 'running')
+    assert.equal(context.resumeCalls, index + 1)
+    const warmupBuffer = context.buffers[index * 2]
+    const warmupSource = context.sources[index * 2]
+    assert.equal(warmupBuffer.length, 12_000)
+    assert.equal(warmupBuffer.sampleRate, 24_000)
+    assert.equal(warmupBuffer.data.every(sample => sample === 0), true)
+    assert.deepEqual(warmupSource.starts, [context.currentTime])
+    assert.deepEqual(warmupSource.offsets, [0])
+    assert.equal(runtime.snapshot().playback.warmupCount, index + 1)
+    assert.equal(runtime.snapshot().playback.sourceCount, 1)
+    assert.equal(runtime.snapshot().playback.queuedBytes, 0)
+    assert.equal(runtime.snapshot().playback.queuedSeconds, 0)
+
+    warmupSource.onended()
+    await submitting
+
+    const speechBuffer = context.buffers[index * 2 + 1]
+    const speechSource = context.sources[index * 2 + 1]
+    assert.equal(speechBuffer.length, payloads[index].length)
+    assert.deepEqual(speechBuffer.copied, Array.from(payloads[index]))
+    assert.equal(speechSource.starts[0], context.currentTime + 0.03)
+    assert.deepEqual(speechSource.offsets, [0])
+    assert.equal(speechSource.playbackRate.value, 1.0)
+    assert.equal(runtime.snapshot().playback.lastSpeechSamples, payloads[index].length)
+    assert.equal(runtime.snapshot().playback.sourceCount, 1)
+    assert.equal(runtime.snapshot().playback.queuedSeconds, payloads[index].length / 24_000)
+    assert.equal(
+      runtime.snapshot().playback.nextTime,
+      context.currentTime + 0.03 + payloads[index].length / 24_000
+    )
+
+    context.currentTime = speechSource.starts[0] + speechBuffer.duration
+    speechSource.onended()
+    await until(() => runtime.snapshot().state === 'listening')
+    assert.equal(runtime.snapshot().playback.sourceCount, 0)
+  }
+
+  assert.equal(context.resumeCalls, 3)
+  const speechBuffers = context.buffers.filter((_buffer, index) => index % 2 === 1)
+  assert.deepEqual(speechBuffers.map(buffer => buffer.copied[0]), payloads.map(samples => samples[0]))
+  assert.deepEqual(speechBuffers.map(buffer => buffer.copied.at(-1)), payloads.map(samples => samples.at(-1)))
+  await runtime.dispose()
+  assert.equal(context.closeCalls, 1)
+})
+
+test('Smart Interrupt and End cancel sink warmup before speech enqueue', async t => {
+  const { testApi } = loadPlugin()
+  for (const action of ['interrupt', 'end']) {
+    await t.test(action, async () => {
+      const warmupGate = deferred()
+      let warmupStarted = false
+      let onFrame = null
+      let enqueueCalls = 0
+      const runtime = testApi.createVoiceRuntime({
+        rest: async path => {
+          if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 1 }
+          if (path === '/smart/turn') return {
+            state: 'listening', session_id: 'smart-1', generation: 1, turn_id: 'turn-1',
+            user_text: 'user', assistant_text: 'answer', audio_base64: 'AAAAAA==',
+            sample_rate: 24_000, warning: null
+          }
+          if (path === '/smart/session/interrupt') return { state: 'listening', session_id: 'smart-1', generation: 1 }
+          if (path === '/smart/session/stop') return { state: 'stopped', session_id: null, generation: 2 }
+          throw new Error(`unexpected path: ${path}`)
+        },
+        storage: {
+          get(key, fallback) {
+            if (key === 'voiceInteractionMode') return 'smart-minicpm'
+            if (key === 'minicpmInputUnderstandingPrompt') return 'input'
+            return fallback
+          }, set() {}
+        },
+        captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+        playbackFactory: async () => ({
+          async ensureRunning() {},
+          async warmup() { warmupStarted = true; await warmupGate.promise },
+          enqueue() { enqueueCalls += 1; return true }, interrupt() {}, snapshot() { return {} }, cleanup: async () => {}
+        })
+      })
+
+      await runtime.start()
+      onFrame(new Float32Array(16).fill(0.2), 0.2)
+      const submitting = runtime.manualDone()
+      await until(() => warmupStarted, `${action} did not reach playback warmup`)
+      const cancelling = runtime[action]()
+      warmupGate.resolve()
+      await Promise.all([submitting, cancelling])
+
+      assert.equal(enqueueCalls, 0)
+      await runtime.dispose()
+    })
+  }
+})
+
+test('Smart input, reasoning, and network 502 turn failures recover in the same session', async t => {
+  const { testApi } = loadPlugin()
+  for (const [failure, safeMessage] of [
+    ['Smart input failed.', 'Smart input failed.'],
+    ['Smart reasoning failed.', 'Smart reasoning failed.'],
+    ['HTTP 502 private upstream network content', 'Smart turn failed.']
+  ]) {
+    await t.test(failure, async () => {
+      let onFrame = null
+      let turnNumber = 0
+      let interrupts = 0
+      let sessionStops = 0
+      let serverStops = 0
+      let playbackInterrupts = 0
+      const paths = []
+      const runtime = testApi.createVoiceRuntime({
+        rest: async path => {
+          paths.push(path)
+          if (path === '/smart/session/start') {
+            return { state: 'listening', session_id: 'smart-1', generation: 1 }
+          }
+          if (path === '/smart/turn') {
+            turnNumber += 1
+            if (turnNumber === 2) throw Object.assign(new Error(failure), { status: 502 })
+            return {
+              state: 'listening', session_id: 'smart-1', generation: 1,
+              turn_id: `turn-${turnNumber}`, user_text: `real interpretation ${turnNumber}`,
+              assistant_text: `real answer ${turnNumber}`, audio_base64: null,
+              sample_rate: null, warning: 'MiniCPM native speech failed.'
+            }
+          }
+          if (path === '/smart/session/interrupt') {
+            interrupts += 1
+            if (failure.startsWith('HTTP 502')) throw new Error('private interrupt cleanup failure')
+            return { state: 'listening', session_id: 'smart-1', generation: 1 }
+          }
+          if (path === '/smart/session/stop') {
+            sessionStops += 1
+            return { state: 'stopped', session_id: null, generation: 2 }
+          }
+          if (path === '/server/stop') { serverStops += 1; return {} }
+          throw new Error(`unexpected path: ${path}`)
+        },
+        storage: {
+          get(key, fallback) {
+            if (key === 'voiceInteractionMode') return 'smart-minicpm'
+            if (key === 'minicpmInputUnderstandingPrompt') return 'input'
+            return fallback
+          }, set() {}
+        },
+        captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+        playbackFactory: async () => ({
+          interrupt() { playbackInterrupts += 1 }, snapshot() { return {} }, cleanup: async () => {}
+        })
+      })
+
+      await runtime.start()
+      const serverBefore = runtime.snapshot().server
+      onFrame(new Float32Array(16).fill(0.2), 0.2)
+      assert.equal(await runtime.manualDone(), true)
+      onFrame(new Float32Array(16).fill(0.2), 0.2)
+      assert.equal(await runtime.manualDone(), false)
+
+      const failed = runtime.snapshot()
+      assert.equal(failed.active, true)
+      assert.equal(failed.state, 'listening')
+      assert.equal(failed.session_id, 'smart-1')
+      assert.equal(failed.generation, 1)
+      assert.equal(failed.errorMessage, safeMessage)
+      assert.deepEqual(failed.server, serverBefore)
+      assert.equal(failed.hasCurrentUtterance, false)
+      assert.deepEqual(JSON.parse(JSON.stringify(failed.turns)), [
+        { id: 'turn-1', userText: 'real interpretation 1', assistantText: 'real answer 1', complete: true },
+        { id: 'local-2', userText: '', assistantText: 'Turn failed.', complete: true }
+      ])
+      assert.doesNotMatch(JSON.stringify(failed.turns), /Interpreting audio|Native audio/)
+      assert.equal(interrupts, 1)
+      assert.equal(sessionStops, 0)
+      assert.equal(serverStops, 0)
+      assert.equal(playbackInterrupts, 1)
+      assert.equal(paths.filter(path => path === '/smart/session/start').length, 1)
+
+      onFrame(new Float32Array(16).fill(0.2), 0.2)
+      assert.equal(await runtime.manualDone(), true)
+      assert.equal(runtime.snapshot().turns.at(-1).id, 'turn-3')
+      assert.equal(runtime.snapshot().active, true)
+      assert.equal(paths.filter(path => path === '/smart/session/start').length, 1)
+      assert.equal(sessionStops, 0)
+      await runtime.dispose()
+    })
+  }
+})
+
+test('Smart resolved response identity mismatch remains fail-closed instead of recoverable', async () => {
+  const { testApi } = loadPlugin()
+  let onFrame = null
+  let interrupts = 0
+  let sessionStops = 0
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 1 }
+      if (path === '/smart/turn') return {
+        state: 'listening', session_id: 'wrong-session', generation: 1, turn_id: 'turn-1',
+        user_text: 'private mismatch', assistant_text: 'private mismatch',
+        audio_base64: null, sample_rate: null, warning: null
+      }
+      if (path === '/smart/session/interrupt') { interrupts += 1; return {} }
+      if (path === '/smart/session/stop') {
+        sessionStops += 1
+        return { state: 'stopped', session_id: null, generation: 2 }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'input'
+        return fallback
+      }, set() {}
+    },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+
+  await runtime.start()
+  onFrame(new Float32Array(16).fill(0.2), 0.2)
+  await assert.rejects(runtime.manualDone(), /invalid response/)
+  assert.equal(runtime.snapshot().active, false)
+  assert.equal(runtime.snapshot().state, 'error')
+  assert.equal(interrupts, 0)
+  assert.equal(sessionStops, 1)
+  await runtime.dispose()
+})
+
+test('Smart thinking ignores microphone frames without changing VAD or enqueueing another turn', async () => {
+  const { testApi } = loadPlugin()
+  let onFrame = null
+  const firstTurn = deferred()
+  let smartTurnCalls = 0
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 1 }
+      if (path === '/smart/turn') { smartTurnCalls += 1; return firstTurn.promise }
+      if (path === '/smart/session/stop') return { state: 'stopped', session_id: null, generation: 2 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'input'
+        return fallback
+      }, set() {}
+    },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+
+  await runtime.start()
+  onFrame(new Float32Array(1_600).fill(0.2), 0.2)
+  const submitting = runtime.manualDone()
+  await until(() => smartTurnCalls === 1)
+  assert.equal(runtime.snapshot().state, 'thinking')
+
+  onFrame(new Float32Array(1_600).fill(0.2), 0.2)
+  onFrame(new Float32Array(64_000), 0)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(smartTurnCalls, 1)
+
+  firstTurn.resolve({
+    state: 'listening', session_id: 'smart-1', generation: 1, turn_id: 'turn-1',
+    user_text: 'first interpretation', assistant_text: 'first answer',
+    audio_base64: null, sample_rate: null, warning: 'MiniCPM native speech failed.'
+  })
+  await submitting
+  assert.equal(runtime.snapshot().state, 'listening')
+  assert.equal(await runtime.manualDone(), false)
+  assert.equal(smartTurnCalls, 1)
+  await runtime.dispose()
+})
+
+test('Smart native-speech failure preserves assistant text and never enqueues substitute audio', async () => {
+  const { testApi } = loadPlugin()
+  let onFrame = null
+  let enqueueCalls = 0
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 1 }
+      if (path === '/smart/turn') return {
+        state: 'listening', session_id: 'smart-1', generation: 1, turn_id: 'turn-1',
+        user_text: 'understood', assistant_text: 'answer survives',
+        audio_base64: null, sample_rate: null, warning: 'MiniCPM native speech failed.'
+      }
+      if (path === '/smart/session/stop') return { state: 'stopped', session_id: null, generation: 2 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'input'
+        return fallback
+      }, set() {}
+    },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({
+      enqueue() { enqueueCalls += 1; return true }, interrupt() {}, snapshot() { return {} }, cleanup: async () => {}
+    })
+  })
+
+  await runtime.start()
+  onFrame(new Float32Array(16).fill(0.2), 0.2)
+  await runtime.manualDone()
+
+  assert.equal(enqueueCalls, 0)
+  assert.equal(runtime.snapshot().turns[0].assistantText, 'answer survives')
+  assert.match(runtime.snapshot().errorMessage, /native speech failed/i)
+  assert.equal(runtime.snapshot().active, true)
+  assert.equal(runtime.snapshot().state, 'listening')
+  await runtime.dispose()
+})
+
+test('Smart Interrupt is concurrent, keeps the session, and isolates its late turn response', async () => {
+  const { testApi } = loadPlugin()
+  const lateTurn = deferred()
+  let onFrame = null
+  const paths = []
+  let interrupts = 0
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      paths.push(path)
+      if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 1 }
+      if (path === '/smart/turn') return lateTurn.promise
+      if (path === '/smart/session/interrupt') { interrupts += 1; return { state: 'listening', session_id: 'smart-1', generation: 1 } }
+      if (path === '/smart/session/stop') return { state: 'stopped', session_id: null, generation: 2 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'input'
+        return fallback
+      }, set() {}
+    },
+    captureFactory: async options => { onFrame = options.onFrame; return { cleanup: async () => {} } },
+    playbackFactory: async () => ({ interrupt() {}, snapshot() { return {} }, cleanup: async () => {} })
+  })
+  await runtime.start()
+  onFrame(new Float32Array(16).fill(0.2), 0.2)
+  const submitting = runtime.manualDone()
+  await until(() => paths.includes('/smart/turn'))
+
+  await runtime.interrupt()
+  assert.equal(interrupts, 1)
+  assert.equal(runtime.snapshot().active, true)
+  assert.equal(runtime.snapshot().state, 'listening')
+  assert.equal(paths.includes('/smart/session/stop'), false)
+  assert.equal(paths.filter(path => path === '/smart/session/start').length, 1)
+
+  lateTurn.resolve({
+    state: 'listening', session_id: 'smart-1', generation: 1, turn_id: 'late',
+    user_text: 'late private user', assistant_text: 'late private answer',
+    audio_base64: null, sample_rate: null, warning: 'late'
+  })
+  await submitting
+  assert.doesNotMatch(JSON.stringify(runtime.snapshot().turns), /late private/)
+  await runtime.dispose()
+})
+
+test('Smart ignores Native events while retaining Server polling', async () => {
+  const { testApi } = loadPlugin()
+  let socketHandler = null
+  let pollCallback = null
+  const paths = []
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      paths.push(path)
+      if (path === '/server/status') return { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+      if (path === '/smart/session/start') return { state: 'listening', session_id: 'smart-1', generation: 3 }
+      if (path === '/smart/session/stop') return { state: 'stopped', session_id: null, generation: 4 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'input'
+        return fallback
+      }, set() {}
+    },
+    captureFactory: async () => ({ cleanup: async () => {} }),
+    playbackFactory: async () => ({ enqueue() { throw new Error('Native audio must be ignored') }, interrupt() {}, snapshot() { return {} }, cleanup: async () => {} }),
+    setIntervalFn: callback => { pollCallback = callback; return 1 }
+  })
+  runtime.bindSocket((_path, handler) => { socketHandler = handler; return () => {} })
+  runtime.startPolling()
+  await runtime.start()
+  socketHandler({ type: 'error', message: 'native error', session_id: 'smart-1', generation: 3 })
+  socketHandler({ type: 'audio.delta', audio: 'AAAAAA==', sample_rate: 24_000, session_id: 'smart-1', generation: 3, turn_id: 'x' })
+  await pollCallback()
+
+  assert.equal(runtime.snapshot().active, true)
+  assert.equal(runtime.snapshot().state, 'listening')
+  assert.deepEqual(paths.slice(-1), ['/server/status'])
+  assert.equal(paths.includes('/status'), false)
+  await runtime.dispose()
+})
+
+test('Smart UI names the exact architecture, separates prompts, and labels turn-based limits', () => {
+  const renderer = createHookRenderer()
+  const { testApi } = loadPlugin({ react: renderer.react })
+  const runtime = {
+    snapshot: () => ({
+      state: 'shell_ready', active: false, muted: false, busy: false, serverBusy: false,
+      interactionMode: 'smart-minicpm', minicpmInputPrompt: '', systemPrompt: '',
+      bargeIn: false, silenceMs: 4_000, assistantText: '', userTranscript: '', turns: [],
+      microphoneLevel: 0, metrics: {}, errorMessage: '',
+      server: { configured: true, state: 'stopped', running: false, managed: false, message: 'Stopped.' }
+    }),
+    subscribe: () => () => {}, startServer() {}, stopServer() {}, start() {}, setMuted() {},
+    manualDone() {}, interrupt() {}, end() {}, setSilenceMs() {}, setBargeIn() {},
+    setInteractionMode() {}, setSystemPromptFromUi() {}, setMinicpmInputPromptFromUi() {}
+  }
+  const page = expandControls(renderer, renderer.render(testApi.EnglishCoachPage, { runtime }))
+  const text = elementText(page)
+  assert.match(text, /Smart · MiniCPM input → Hermes text model → MiniCPM native voice/)
+  assert.match(text, /Prompts.*MiniCPM unset.*Coach unset.*Details/)
+  assert.doesNotMatch(text, /MiniCPM input-understanding prompt|GPT\/Coach model prompt/)
+  assert.match(text, /not full duplex/i)
+  assert.doesNotMatch(text, /Whisper|EdgeTTS|Edge TTS/i)
+})
+
+test('Smart Clear chat clears backend and every UI history field while preserving the live session', async () => {
+  const { testApi } = loadPlugin()
+  let onFrame = null
+  const calls = []
+  const storageWrites = []
+  const runtime = testApi.createVoiceRuntime({
+    rest: async (path, options) => {
+      calls.push({ path, options })
+      if (path === '/smart/session/start') {
+        return { state: 'listening', session_id: 'smart-1', generation: 7 }
+      }
+      if (path === '/smart/turn') return {
+        state: 'listening', session_id: 'smart-1', generation: 7, turn_id: 'turn-1',
+        user_text: 'clean user speech', assistant_text: 'coach answer',
+        audio_base64: null, sample_rate: null, warning: 'MiniCPM native speech failed.'
+      }
+      if (path === '/smart/session/clear-history') {
+        return { state: 'listening', session_id: 'smart-1', generation: 7 }
+      }
+      if (path === '/smart/session/stop') {
+        return { state: 'stopped', session_id: null, generation: 8 }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'input prompt stays'
+        if (key === 'userOwnedModelPrompt') return 'coach prompt stays'
+        return fallback
+      },
+      set(key, value) { storageWrites.push([key, value]) }
+    },
+    captureFactory: async options => {
+      onFrame = options.onFrame
+      return { cleanup: async () => {} }
+    },
+    playbackFactory: async () => ({
+      interrupt() {}, snapshot() { return {} }, cleanup: async () => {}
+    })
+  })
+
+  await runtime.start()
+  onFrame(new Float32Array(16).fill(0.2), 0.2)
+  await runtime.manualDone()
+  assert.equal(runtime.snapshot().turns.length, 1)
+  assert.equal(runtime.snapshot().userTranscript, 'clean user speech')
+  assert.equal(runtime.snapshot().assistantText, 'coach answer')
+
+  const cleared = await runtime.clearChat()
+
+  assert.equal(cleared.active, true)
+  assert.equal(cleared.state, 'listening')
+  assert.equal(cleared.session_id, 'smart-1')
+  assert.equal(cleared.generation, 7)
+  assert.deepEqual(JSON.parse(JSON.stringify(cleared.turns)), [])
+  assert.equal(cleared.userTranscript, '')
+  assert.equal(cleared.assistantText, '')
+  assert.equal(cleared.systemPrompt, 'coach prompt stays')
+  assert.equal(cleared.minicpmInputPrompt, 'input prompt stays')
+  assert.deepEqual(storageWrites, [])
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.at(-1))), {
+    path: '/smart/session/clear-history',
+    options: { method: 'POST', body: {} }
+  })
+  assert.equal(calls.some(call => call.path.startsWith('/server/')), false)
+
+  await runtime.dispose()
+})
+
+test('Clear chat is local when inactive, unavailable for active Native, and preserves history on identity mismatch', async () => {
+  const { testApi } = loadPlugin()
+  let onFrame = null
+  const paths = []
+  const runtime = testApi.createVoiceRuntime({
+    rest: async path => {
+      paths.push(path)
+      if (path === '/smart/session/start') {
+        return { state: 'listening', session_id: 'smart-1', generation: 3 }
+      }
+      if (path === '/smart/turn') return {
+        state: 'listening', session_id: 'smart-1', generation: 3, turn_id: 'turn-1',
+        user_text: 'visible user', assistant_text: 'visible answer',
+        audio_base64: null, sample_rate: null, warning: 'voice failed'
+      }
+      if (path === '/smart/session/clear-history') {
+        return { state: 'listening', session_id: 'wrong-session', generation: 3 }
+      }
+      if (path === '/smart/session/stop') {
+        return { state: 'stopped', session_id: null, generation: 4 }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: {
+      get(key, fallback) {
+        if (key === 'voiceInteractionMode') return 'smart-minicpm'
+        if (key === 'minicpmInputUnderstandingPrompt') return 'input'
+        return fallback
+      },
+      set() {}
+    },
+    captureFactory: async options => {
+      onFrame = options.onFrame
+      return { cleanup: async () => {} }
+    },
+    playbackFactory: async () => ({
+      interrupt() {}, snapshot() { return {} }, cleanup: async () => {}
+    })
+  })
+
+  await runtime.start()
+  onFrame(new Float32Array(16).fill(0.2), 0.2)
+  await runtime.manualDone()
+  await assert.rejects(runtime.clearChat(), /invalid response/)
+  assert.equal(runtime.snapshot().turns.length, 1)
+  assert.equal(runtime.snapshot().userTranscript, 'visible user')
+  assert.equal(runtime.snapshot().assistantText, 'visible answer')
+
+  await runtime.end()
+  const clearCallsBefore = paths.filter(path => path === '/smart/session/clear-history').length
+  const inactiveCleared = await runtime.clearChat()
+  assert.deepEqual(JSON.parse(JSON.stringify(inactiveCleared.turns)), [])
+  assert.equal(inactiveCleared.userTranscript, '')
+  assert.equal(inactiveCleared.assistantText, '')
+  assert.equal(paths.filter(path => path === '/smart/session/clear-history').length, clearCallsBefore)
+  await runtime.dispose()
+
+  let nativeOnFrame = null
+  const nativePaths = []
+  const native = testApi.createVoiceRuntime({
+    rest: async path => {
+      nativePaths.push(path)
+      if (path === '/session/start') return { state: 'listening', session_id: 'native-1', generation: 1 }
+      if (path === '/turn') return { state: 'thinking', session_id: 'native-1', generation: 1, turn_id: 'native-turn' }
+      if (path === '/session/stop') return { state: 'stopped', session_id: null, generation: 2 }
+      throw new Error(`unexpected path: ${path}`)
+    },
+    storage: { get: (_key, fallback) => fallback, set() {} },
+    captureFactory: async options => {
+      nativeOnFrame = options.onFrame
+      return { cleanup: async () => {} }
+    },
+    playbackFactory: async () => ({
+      interrupt() {}, snapshot() { return {} }, cleanup: async () => {}
+    })
+  })
+  await native.start()
+  nativeOnFrame(new Float32Array(16).fill(0.2), 0.2)
+  await native.manualDone()
+  const nativeBefore = native.snapshot()
+  const nativeAfter = await native.clearChat()
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(nativeAfter.turns)),
+    JSON.parse(JSON.stringify(nativeBefore.turns))
+  )
+  assert.equal(nativePaths.includes('/smart/session/clear-history'), false)
+  await native.dispose()
+})
+
+test('Clear chat button has the exact label and strict mode, busy, server, and visibility controls', () => {
+  const base = {
+    state: 'listening', active: true, muted: false, busy: false, serverBusy: false,
+    interactionMode: 'smart-minicpm', minicpmInputPrompt: 'input', systemPrompt: '',
+    bargeIn: false, silenceMs: 4_000, noiseThreshold: 0.04,
+    assistantText: 'answer', userTranscript: 'user',
+    turns: [{ id: 'turn-1', userText: 'user', assistantText: 'answer', complete: true }],
+    microphoneLevel: 0, metrics: {}, errorMessage: '', hasCurrentUtterance: false,
+    server: { configured: true, state: 'ready', running: true, managed: true, message: 'Ready.' }
+  }
+  const buttonFor = overrides => {
+    const renderer = createHookRenderer()
+    const { testApi } = loadPlugin({ react: renderer.react })
+    const runtime = {
+      snapshot: () => ({ ...base, ...overrides }), subscribe: () => () => {},
+      startServer() {}, stopServer() {}, start() {}, setMuted() {}, manualDone() {},
+      discardUtterance() {}, interrupt() {}, end() {}, clearChat() { return Promise.resolve() },
+      setSilenceMs() {}, setNoiseThreshold() {}, setBargeIn() {}, setInteractionMode() {},
+      setSystemPromptFromUi() {}, setMinicpmInputPromptFromUi() {}
+    }
+    const page = expandControls(renderer, renderer.render(testApi.EnglishCoachPage, { runtime }))
+    const matches = descendants(page).filter(element => elementText(element) === 'Clear chat')
+    assert.equal(matches.length, 1)
+    return matches[0]
+  }
+
+  assert.equal(buttonFor({}).props.disabled, false)
+  assert.equal(buttonFor({ active: false }).props.disabled, false)
+  assert.equal(buttonFor({ interactionMode: 'native' }).props.disabled, true)
+  assert.equal(buttonFor({ busy: true }).props.disabled, true)
+  assert.equal(buttonFor({ serverBusy: true }).props.disabled, true)
+  assert.equal(buttonFor({ turns: [], assistantText: '', userTranscript: '' }).props.disabled, true)
 })

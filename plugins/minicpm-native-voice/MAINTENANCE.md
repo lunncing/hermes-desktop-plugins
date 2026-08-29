@@ -52,6 +52,22 @@ three revisions and replace `NOT RUN` with `PASS`/`FAIL` in the release or pull
 request record; do not commit machine paths, logs, audio, credentials, or prompt
 contents.
 
+For the Windows-only experimental Smart candidate, also verify Native is still
+the persisted default, Smart Start loads the Server on demand, the two visible
+prompt fields remain independent, and the current or explicitly saved Hermes text-model route is
+the only non-loopback stage. Provider privacy, network transfer, cost, and
+latency must be reviewed for that route. The Smart production path must contain
+no separate transcription implementation, alternate voice fallback, or hidden
+input instructions. Its reasoning stage must use the Hermes host `PluginLlm`
+current or explicitly saved model through central authentication without
+selecting an auxiliary slot or fallback pool. Explicit model selection also
+requires plugin-scoped `allow_provider_override: true` and
+`allow_model_override: true` with `allowed_providers: ["*"]` and
+`allowed_models: ["*"]`. The wildcard trust is safe because Start validates the
+pair against the central authenticated inventory; do not put credentials or
+Base URLs in Coach storage and do not modify deployment config as part of a
+source-only release.
+
 | Area | Procedure | Expected result | Initial status |
 |---|---|---|---|
 | Clean unified install | Install the repository subdirectory disabled, run Plugin Doctor, enable backend, restart dashboard, enable Desktop half | One package supplies backend and Desktop; English Coach route/nav/command appear | NOT RUN |
@@ -62,15 +78,19 @@ contents.
 | Prompt empty | Clear the prompt, End/Start, remount route, restart Desktop | Field remains exactly empty and no hidden/default model-facing prose is sent | NOT RUN |
 | Prompt persistence | Enter a non-sensitive marker with deliberate surrounding whitespace; repeat End/Start, remount, hot reload, full restart | The exact value and whitespace persist and reach session init once | NOT RUN |
 | Prompt byte ceiling | Use synthetic prompts of exactly 65,536 and 65,537 UTF-8 bytes at Desktop and API boundaries, including a multibyte paste below the textarea character limit but above the byte limit | The boundary value persists and is sent exactly; the larger value is rejected before storage/session mutation or upstream serialization, the prior controlled value remains visible/stored, and a bounded alert appears without an uncaught UI exception, trimming, or truncation | NOT RUN |
+| Controls collapse | Open/remount English Coach, expand Controls, then hide it while a session and history are present | Each mount starts collapsed with only the compact Controls/mode/Details row from the configuration area; meter, history, timing, and errors remain visible; Details/Hide changes no session, model, prompt, Server, or runtime state | NOT RUN |
+| Prompt collapse | Expand Controls, expand Prompts, edit both fields, then hide Prompts and Controls | Prompts starts nested-collapsed with accurate MiniCPM/Coach set status; Details/Hide changes only page-local visibility and the exact existing fields/handlers remain authoritative | NOT RUN |
 | Microphone permission | Select Start with permission undecided, then allow | One mic stream opens, meter responds, and UI enters listening | NOT RUN |
 | Microphone denial | Deny permission | Controlled error appears and no track/context remains owned | NOT RUN |
 | Initial silence | Start, remain silent for 30 seconds, then speak continuously to the 60-second cap | One turn contains at most 500 ms pre-roll plus the full 60 seconds from speech onset; the earlier silence is absent | NOT RUN |
+| Voice trigger threshold | At the default setting feed/produce levels around `0.03` and `0.05`; change the threshold during an unsent utterance and repeat after reset/restart | `0.03` does not start default VAD, `0.05` does; the persisted current threshold is used on every capture generation and changing it discards the old unsent generation atomically | NOT RUN |
 | Normal turn | Speak one sentence and wait through the silence window | One native-audio turn uploads, state moves thinking -> speaking -> listening, text/audio arrive incrementally | NOT RUN |
 | Persistent history | Complete enough 64 KiB-field turns to exceed 1 MiB, then End/Start without recreating the plugin runtime; also inject late text/audio and duplicate done events | Chronological user-right/assistant-left bubbles remain readable; oldest completed turns are evicted first at 100 turns or 1 MiB combined UTF-8 text; the active pending turn remains; completed assistant text/audio stay frozen | NOT RUN |
 | Display-only STT | Run with configured STT success, configured failure plus installed local fallback, and total STT failure | The correct right bubble updates by turn ID on success, including after response completion; failure leaves `Native audio · N s`; native model input/response proceeds without waiting; no cloud provider, package, or model is configured, installed, or downloaded by the plugin | NOT RUN |
 | Multipart temporary-file cleanup | Point the packaged runtime's temp directory at an isolated test location, submit accepted and oversized turns, then end the session | FastAPI/Starlette may spool upload bytes there before route validation; each request closes its `UploadFile` and releases active temporary files, with any filesystem remanence handled by local policy | NOT RUN |
 | Manual turn end | Speak and select I'm done before the silence timeout | Exactly one turn submits immediately | NOT RUN |
-| Playback quality | Listen to short, 60-second, and multi-chunk responses through the intended device and inspect state after upstream completion but before the final source ends | First audio begins intact after the 30 ms lead-in; chunks are gapless and final words play; state remains speaking until the final scheduled source drains, then returns to listening | NOT RUN |
+| Discard utterance | Arm auto-submit and separately queue manual submit, then select Discard before lifecycle execution; speak and submit again | No first `/turn` or `/smart/turn`, bubble, transcript, history, session interruption, or REST side effect occurs; active listening/server state remains and new speech submits normally | NOT RUN |
+| Playback quality | Listen to short, 60-second, and multi-chunk responses through the intended device and inspect state after upstream completion but before the final source ends | First audio begins intact after the 30 ms lead-in; Smart audio plays at generated PCM pitch/speed (`1.0x`); chunks are gapless and final words play; state remains speaking until the final scheduled source drains, then returns to listening | NOT RUN |
 | Interrupt | During playback select Interrupt | Playback stops immediately; a fresh session starts with the exact same prompt; no old delta plays | NOT RUN |
 | Experimental barge-in | Enable toggle, speak for at least 300 ms during playback | Playback/session restart occurs once and bounded pre-roll begins the new turn | NOT RUN |
 | End cleanup | Select End while listening, thinking, transcribing, and speaking in separate runs | Tracks, nodes, contexts, sources, sockets, STT tasks/WAVs, timers, and queues release; state returns shell_ready | NOT RUN |
@@ -78,6 +98,10 @@ contents.
 | Backend restart ownership | Start managed Server, restart/crash backend, reopen page | Surviving Server is external and is not killed by plugin controls | NOT RUN |
 | Reload behavior | Update package, restart dashboard, reload Desktop plugins | New backend and Desktop revisions load without duplicate routes, sockets, timers, or stale state | NOT RUN |
 | OAuth-remote limitation | Connect with the remote OAuth Desktop mode if available | Polling may show state; incremental socket audio is documented unavailable rather than misrepresented as supported | NOT RUN |
+| Smart prompt separation | Select Smart, leave input instructions blank, then use distinct non-sensitive markers in both fields and restart the session | Blank Smart Start is rejected; each exact prompt reaches only its owned stage and edits apply on the next session | NOT RUN |
+| Smart real chain | With the separately built candidate Server, select Smart and complete one synthetic/non-sensitive spoken turn through the current or explicitly saved Hermes text route | Right bubble is the MiniCPM interpretation, left bubble is exact model text, native 24 kHz speech drains fully, and no alternate path is used | NOT RUN |
+| Smart unknown token | Return split `<u` + `nk>` deltas and final `<unk> um a little faster`, then repeat with mid-sentence and `<UNK>` text | No split/whole exact `<unk>` is displayed or sent onward; final text is `um a little faster`; case variants remain literal and hard wrappers still fail closed | NOT RUN |
+| Smart interruption and ownership | Interrupt input/reasoning/speech turns, then End against both a session-started Server and an independently running Server | Late results remain inert; history stays visible; only the session-started Server stops | NOT RUN |
 
 Also capture non-sensitive timing observations for session creation, first text,
 first audio, and return to listening. Performance targets are hardware-specific;

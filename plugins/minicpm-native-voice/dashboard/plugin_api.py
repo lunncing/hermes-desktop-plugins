@@ -33,17 +33,23 @@ from fastapi import (
     APIRouter,
     File,
     HTTPException,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
     status as http_status,
 )
 from pydantic import BaseModel, ConfigDict, StrictInt, field_validator
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 
 @asynccontextmanager
 async def _plugin_lifespan(_app: Any):
     yield
+    active_smart_session = globals().get("smart_session")
+    if active_smart_session is not None:
+        with contextlib.suppress(Exception):
+            await active_smart_session.stop()
     active_bridge = globals().get("bridge")
     if active_bridge is not None:
         with contextlib.suppress(Exception):
@@ -63,6 +69,37 @@ ALLOWED_HTTP_PATHS = frozenset({"/health"})
 MAX_AUDIO_BYTES = 5_242_880
 INPUT_AUDIO_SAMPLE_RATE = 16_000
 MAX_SYSTEM_PROMPT_BYTES = 65_536
+MAX_SMART_MODEL_PROVIDERS = 64
+MAX_SMART_MODELS_PER_PROVIDER = 500
+MAX_SMART_PROVIDER_BYTES = 128
+MAX_SMART_MODEL_BYTES = 512
+MAX_SMART_PROVIDER_LABEL_BYTES = 256
+MAX_SMART_TEXT_BYTES = 65_536
+SMART_TEXT_DELTA_PREFIX_CHARS = 16
+MAX_SMART_HISTORY_PAIRS = 32
+MAX_SMART_HISTORY_BYTES = 512 * 1024
+MINICPM_INPUT_REJECTED_FRAGMENTS = (
+    "<|SOA|>",
+    "<|EOA|>",
+    "\0",
+    "dataset_audio_identifier",
+)
+MINICPM_UNKNOWN_TOKEN = "<unk>"
+MINICPM_LEADING_METADATA_PREFIXES = (
+    "Original sentence:",
+    "The transcription of the given speech is:",
+)
+SMART_INPUT_TIMEOUT_SECONDS = 120.0
+SMART_GPT_TIMEOUT_SECONDS = 120.0
+SMART_TTS_TIMEOUT_SECONDS = 120.0
+SMART_TTS_SAMPLE_RATE = 24_000
+SMART_TTS_MAX_SECONDS = 75
+SMART_TTS_URL = "http://127.0.0.1:9060/v1/audio/speech/minicpm"
+SMART_ROUTE_INFO = {
+    "source": "minicpm-native-voice",
+    "operation": "smart-minicpm",
+}
+_smart_llm_facade: Any | None = None
 NATIVE_AUDIO_CONTENT_TYPE = "application/octet-stream"
 EVENT_QUEUE_MAX = 64
 EVENT_QUEUE_MAX_BYTES = 12 * 1024 * 1024
@@ -626,6 +663,22 @@ class BridgeUpstreamError(RuntimeError):
     """Raised when the fixed loopback upstream cannot satisfy an operation."""
 
 
+class SmartSessionError(RuntimeError):
+    """A public-safe Smart session operation failure."""
+
+
+class SmartSessionConflict(SmartSessionError):
+    """A Smart session or turn ownership conflict."""
+
+
+class SmartStageError(SmartSessionError):
+    """A content-free failure from one bounded Smart pipeline stage."""
+
+
+class SmartModelSelectionUnavailable(ValueError):
+    """The requested central provider/model pair cannot be selected."""
+
+
 def validate_upstream_port(port: int) -> int:
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
         raise ValueError("upstream port must be an integer in 1..65535")
@@ -699,6 +752,409 @@ def build_turn_payload(raw: bytes) -> dict[str, Any]:
             },
         },
     }
+
+
+def validate_minicpm_input_prompt(value: str) -> str:
+    validate_system_prompt(value)
+    if not value.strip():
+        raise ValueError("minicpm_input_prompt must not be blank")
+    return value
+
+
+def load_smart_models_inventory(
+    refresh: bool,
+    *,
+    load_context: Callable[[], Any],
+    build_payload: Callable[..., dict[str, Any]],
+    build_aux_rows: Callable[..., list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Read the host-owned provider inventory without resolving credentials here."""
+    context = load_context()
+    if refresh:
+        return build_payload(
+            context,
+            for_picker=True,
+            refresh=True,
+            probe_custom_providers=True,
+            probe_current_custom_provider=False,
+            max_models=MAX_SMART_MODELS_PER_PROVIDER,
+        )
+    rows = build_aux_rows(
+        current_provider=context.current_provider,
+        current_model=context.current_model,
+        current_base_url=context.current_base_url,
+        max_models=MAX_SMART_MODELS_PER_PROVIDER,
+    )
+    return {
+        "provider": context.current_provider,
+        "model": context.current_model,
+        "providers": rows,
+    }
+
+
+def _default_smart_models_inventory_loader(refresh: bool) -> dict[str, Any]:
+    from hermes_cli.inventory import (
+        build_aux_picker_rows,
+        build_models_payload,
+        load_picker_context,
+    )
+
+    return load_smart_models_inventory(
+        bool(refresh),
+        load_context=load_picker_context,
+        build_payload=build_models_payload,
+        build_aux_rows=build_aux_picker_rows,
+    )
+
+
+smart_models_inventory_loader: Callable[[bool], dict[str, Any]] = (
+    _default_smart_models_inventory_loader
+)
+
+
+def _bounded_smart_model_identity(value: Any, max_bytes: int) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    return value if len(value.encode("utf-8")) <= max_bytes else ""
+
+
+def sanitize_smart_models_catalog(payload: Any) -> dict[str, Any]:
+    """Whitelist and bound the only provider data exposed to the Coach."""
+    if not isinstance(payload, dict):
+        raise ValueError("invalid model inventory")
+    current_provider = _bounded_smart_model_identity(
+        payload.get("provider"), MAX_SMART_PROVIDER_BYTES
+    )
+    current_model = _bounded_smart_model_identity(
+        payload.get("model"), MAX_SMART_MODEL_BYTES
+    )
+    raw_rows = payload.get("providers")
+    if not isinstance(raw_rows, list):
+        raise ValueError("invalid model inventory")
+
+    rows_by_provider: dict[str, dict[str, Any]] = {}
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, dict):
+            continue
+        provider = _bounded_smart_model_identity(
+            raw_row.get("slug", raw_row.get("provider")),
+            MAX_SMART_PROVIDER_BYTES,
+        )
+        if not provider or provider.casefold() == "moa":
+            continue
+        explicitly_unavailable = (
+            raw_row.get("authenticated") is False
+            and raw_row.get("configured") is not True
+            and raw_row.get("is_user_defined") is not True
+        )
+        if explicitly_unavailable and provider != current_provider:
+            continue
+        label_value = raw_row.get("name", raw_row.get("label", provider))
+        label = label_value if isinstance(label_value, str) and label_value else provider
+        label = _utf8_prefix(label, MAX_SMART_PROVIDER_LABEL_BYTES)
+        models_value = raw_row.get("models")
+        models = models_value if isinstance(models_value, (list, tuple)) else []
+        sanitized_models = {
+            model
+            for model in models
+            if _bounded_smart_model_identity(model, MAX_SMART_MODEL_BYTES)
+        }
+        existing = rows_by_provider.get(provider)
+        if existing is None:
+            rows_by_provider[provider] = {
+                "provider": provider,
+                "label": label,
+                "models": sanitized_models,
+            }
+        else:
+            existing["models"].update(sanitized_models)
+
+    if current_provider and current_provider.casefold() != "moa":
+        current_row = rows_by_provider.setdefault(
+            current_provider,
+            {
+                "provider": current_provider,
+                "label": current_provider,
+                "models": set(),
+            },
+        )
+        if current_model:
+            current_row["models"].add(current_model)
+
+    rows = [
+        {
+            "provider": row["provider"],
+            "label": row["label"],
+            "models": sorted(row["models"], key=lambda model: (model.casefold(), model))[
+                :MAX_SMART_MODELS_PER_PROVIDER
+            ],
+        }
+        for row in rows_by_provider.values()
+    ]
+    rows.sort(key=lambda row: (row["label"].casefold(), row["provider"]))
+    if len(rows) > MAX_SMART_MODEL_PROVIDERS:
+        selected = rows[:MAX_SMART_MODEL_PROVIDERS]
+        if current_provider and not any(
+            row["provider"] == current_provider for row in selected
+        ):
+            current_row = next(
+                row for row in rows if row["provider"] == current_provider
+            )
+            selected[-1] = current_row
+            selected.sort(key=lambda row: (row["label"].casefold(), row["provider"]))
+        rows = selected
+    return {
+        "current": {"provider": current_provider, "model": current_model},
+        "providers": rows,
+    }
+
+
+def validate_smart_model_pair_shape(provider: Any, model: Any) -> tuple[str, str]:
+    if not isinstance(provider, str) or not isinstance(model, str):
+        raise SmartModelSelectionUnavailable("invalid model selection")
+    if bool(provider) != bool(model):
+        raise SmartModelSelectionUnavailable("incomplete model selection")
+    if provider and (
+        len(provider.encode("utf-8")) > MAX_SMART_PROVIDER_BYTES
+        or len(model.encode("utf-8")) > MAX_SMART_MODEL_BYTES
+    ):
+        raise SmartModelSelectionUnavailable("invalid model selection")
+    return provider, model
+
+
+async def validate_smart_model_selection(
+    provider: str,
+    model: str,
+    *,
+    inventory_loader: Callable[[bool], dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    provider, model = validate_smart_model_pair_shape(provider, model)
+    if not provider:
+        return "", ""
+    loader = inventory_loader or smart_models_inventory_loader
+    try:
+        payload = await asyncio.to_thread(loader, False)
+        catalog = sanitize_smart_models_catalog(payload)
+    except SmartModelSelectionUnavailable:
+        raise
+    except Exception as exc:
+        raise SmartModelSelectionUnavailable("model inventory unavailable") from exc
+    if not any(
+        row["provider"] == provider and model in row["models"]
+        for row in catalog["providers"]
+    ):
+        raise SmartModelSelectionUnavailable("model selection unavailable")
+    return provider, model
+
+
+def strip_minicpm_leading_metadata(value: str) -> str:
+    text = value.strip()
+    while True:
+        for prefix in MINICPM_LEADING_METADATA_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix) :].lstrip()
+                break
+        else:
+            return text
+
+
+def sanitize_minicpm_stream_leading_text(value: str) -> tuple[str, bool]:
+    text = value.lstrip()
+    removed_metadata = False
+    while True:
+        for prefix in MINICPM_LEADING_METADATA_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix) :].lstrip()
+                removed_metadata = True
+                break
+        else:
+            holds_partial_prefix = not text or any(
+                prefix.startswith(text)
+                for prefix in MINICPM_LEADING_METADATA_PREFIXES
+            )
+            return text if removed_metadata else value, holds_partial_prefix
+
+
+def validate_minicpm_interpretation(value: Any) -> str:
+    if not isinstance(value, str) or any(
+        fragment in value for fragment in MINICPM_INPUT_REJECTED_FRAGMENTS
+    ):
+        raise SmartStageError("input stage failed")
+    text = _utf8_prefix(
+        strip_minicpm_leading_metadata(
+            value.replace(MINICPM_UNKNOWN_TOKEN, "")
+        ),
+        MAX_SMART_TEXT_BYTES,
+    )
+    if not text:
+        raise SmartStageError("input stage failed")
+    return text
+
+
+def sanitize_minicpm_stream_chunk(tail: str, chunk: str) -> tuple[str, str]:
+    sanitized = (tail + chunk).replace(MINICPM_UNKNOWN_TOKEN, "")
+    for suffix_length in range(len(MINICPM_UNKNOWN_TOKEN) - 1, 0, -1):
+        candidate = MINICPM_UNKNOWN_TOKEN[:suffix_length]
+        if sanitized.endswith(candidate):
+            return sanitized[:-suffix_length], candidate
+    return sanitized, ""
+
+
+def build_smart_input_payload(raw: bytes, minicpm_input_prompt: str) -> dict[str, Any]:
+    validate_audio_bytes(raw)
+    prompt = validate_minicpm_input_prompt(minicpm_input_prompt)
+    encoded = base64.b64encode(raw).decode("ascii")
+    return {
+        "type": "input.append",
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio", "data": encoded},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+            "streaming": True,
+            "audio_task_mode": "user_prompt_after_audio",
+            "tts": {"enabled": False},
+            "use_tts_template": False,
+            "generation": {
+                "max_new_tokens": TURN_MAX_NEW_TOKENS,
+                "length_penalty": TURN_LENGTH_PENALTY,
+            },
+        },
+    }
+
+
+def build_smart_gpt_messages(
+    gpt_system_prompt: str,
+    history: list[tuple[str, str]],
+    current_user_text: str,
+) -> list[dict[str, str]]:
+    prompt = validate_system_prompt(gpt_system_prompt)
+    if not isinstance(current_user_text, str) or not current_user_text:
+        raise ValueError("current user text must not be empty")
+    messages: list[dict[str, str]] = []
+    if prompt:
+        messages.append({"role": "system", "content": prompt})
+    for user_text, assistant_text in history:
+        messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "assistant", "content": assistant_text})
+    messages.append({"role": "user", "content": current_user_text})
+    return messages
+
+
+def validate_smart_audio_bytes(raw: bytes) -> bytes:
+    validate_audio_bytes(raw)
+    samples = array.array("f")
+    samples.frombytes(raw)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if any(not math.isfinite(sample) or sample < -1.0 or sample > 1.0 for sample in samples):
+        raise AudioValidationError("audio samples must be finite and within -1..1")
+    return raw
+
+
+def build_smart_tts_request(assistant_text: str) -> dict[str, Any]:
+    if not isinstance(assistant_text, str) or not assistant_text.strip():
+        raise SmartStageError("native speech stage failed")
+    return {
+        "url": SMART_TTS_URL,
+        "json": {"input": assistant_text, "response_format": "f32le_json"},
+    }
+
+
+def validate_smart_tts_response(
+    payload: Any, assistant_text: str
+) -> tuple[str, bytes]:
+    try:
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"text", "audio", "sample_rate"}
+            or payload.get("text") != assistant_text
+        ):
+            raise ValueError
+        if payload.get("sample_rate") != SMART_TTS_SAMPLE_RATE:
+            raise ValueError
+        encoded = payload.get("audio")
+        if not isinstance(encoded, str) or not encoded:
+            raise ValueError
+        encoded_bytes = encoded.encode("ascii")
+        max_bytes = min(
+            MAX_GENERATED_AUDIO_BYTES,
+            SMART_TTS_SAMPLE_RATE * SMART_TTS_MAX_SECONDS * 4,
+        )
+        max_encoded = 4 * ((max_bytes + 2) // 3)
+        if len(encoded_bytes) > max_encoded:
+            raise ValueError
+        raw = base64.b64decode(encoded_bytes, validate=True)
+        if not raw or len(raw) % 4 or len(raw) > max_bytes:
+            raise ValueError
+        samples = array.array("f")
+        samples.frombytes(raw)
+        if sys.byteorder != "little":
+            samples.byteswap()
+        if any(
+            not math.isfinite(sample) or sample < -1.0 or sample > 1.0
+            for sample in samples
+        ):
+            raise ValueError
+        return encoded, raw
+    except (UnicodeEncodeError, ValueError, base64.binascii.Error) as exc:
+        raise SmartStageError("native speech stage failed") from exc
+
+
+async def _default_smart_llm_caller(
+    *, messages: list[dict[str, str]], provider: str = "", model: str = ""
+) -> Any:
+    global _smart_llm_facade
+    if _smart_llm_facade is None:
+        from agent.plugin_llm import PluginLlm
+
+        _smart_llm_facade = PluginLlm(plugin_id="minicpm-native-voice")
+    kwargs: dict[str, Any] = {
+        "timeout": SMART_GPT_TIMEOUT_SECONDS,
+        "purpose": "smart-minicpm",
+    }
+    if provider or model:
+        if not provider or not model:
+            raise SmartModelSelectionUnavailable("incomplete model selection")
+        kwargs.update(provider=provider, model=model)
+    return await _smart_llm_facade.acomplete(messages, **kwargs)
+
+
+async def _default_smart_tts_caller(assistant_text: str) -> Any:
+    request = build_smart_tts_request(assistant_text)
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(SMART_TTS_TIMEOUT_SECONDS), trust_env=False
+    ) as client:
+        response = await client.post(request["url"], json=request["json"])
+    response.raise_for_status()
+    return response.json()
+
+
+def _smart_assistant_text(result: Any) -> str:
+    def field(value: Any, name: str) -> Any:
+        if isinstance(value, dict):
+            return value.get(name)
+        return getattr(value, name, None)
+
+    text: Any = result if isinstance(result, str) else field(result, "text")
+    if not isinstance(text, str):
+        text = field(result, "content")
+    if not isinstance(text, str):
+        choices = field(result, "choices")
+        text = None
+        if isinstance(choices, list) and choices:
+            message = field(choices[0], "message")
+            text = field(message, "content")
+    if not isinstance(text, str) or not text.strip():
+        raise SmartStageError("reasoning stage failed")
+    if len(text.encode("utf-8")) > MAX_SMART_TEXT_BYTES:
+        raise SmartStageError("reasoning stage failed")
+    return text
 
 
 def serialize_upstream_message(message: dict[str, Any]) -> str:
@@ -1579,6 +2035,524 @@ class VoiceBridge:
                 self._stop_task = None
 
 
+class SmartMiniCPMSession:
+    """One dependency-injectable, turn-based Smart Coach session."""
+
+    def __init__(
+        self,
+        *,
+        server_manager: Any,
+        connector: Callable[..., Awaitable[Any]] | None = None,
+        close_session_request: Callable[[str, int], Awaitable[None]] | None = None,
+        llm_caller: Callable[..., Awaitable[Any]] | None = None,
+        tts_caller: Callable[[str], Awaitable[Any]] | None = None,
+        events: EventBroker | None = None,
+    ):
+        self.server_manager = server_manager
+        self.connector = connector or _connect_upstream
+        self.close_session_request = close_session_request or _request_session_close
+        self.llm_caller = llm_caller
+        self.tts_caller = tts_caller
+        self.events = events or EventBroker()
+        self._lock = asyncio.Lock()
+        self._generation = 0
+        self._session_id: str | None = None
+        self._gpt_system_prompt = ""
+        self._minicpm_input_prompt = ""
+        self._model_provider = ""
+        self._model_name = ""
+        self._history: list[tuple[str, str]] = []
+        self._active_turn_task: asyncio.Task | None = None
+        self._turn_generation = 0
+        self._owns_server = False
+        self._starting = False
+        self._start_task: asyncio.Task | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "state": "listening" if self._session_id is not None else "stopped",
+            "session_id": self._session_id,
+            "generation": self._generation,
+            "turn_active": bool(
+                self._active_turn_task is not None
+                and not self._active_turn_task.done()
+            ),
+        }
+
+    async def start(
+        self,
+        gpt_system_prompt: str,
+        minicpm_input_prompt: str,
+        model_provider: str = "",
+        model_name: str = "",
+    ) -> dict[str, Any]:
+        gpt_prompt = validate_system_prompt(gpt_system_prompt)
+        input_prompt = validate_minicpm_input_prompt(minicpm_input_prompt)
+        frozen_provider, frozen_model = validate_smart_model_pair_shape(
+            model_provider, model_name
+        )
+        current_task = asyncio.current_task()
+        async with self._lock:
+            if self._session_id is not None or self._starting:
+                raise SmartSessionConflict("a Smart session is already active")
+            self._generation += 1
+            generation = self._generation
+            self._starting = True
+            self._start_task = current_task
+        started_here = False
+        try:
+            prior = await self.server_manager.status()
+            usable = bool(prior.get("running")) and prior.get("state") in {
+                "ready",
+                "external",
+            }
+            current = prior
+            if not usable:
+                current = await self.server_manager.start()
+                started_here = bool(current.get("managed"))
+            if not bool(current.get("running")) or current.get("state") not in {
+                "ready",
+                "external",
+            }:
+                raise SmartSessionError("Smart voice server is unavailable")
+            async with self._lock:
+                if (
+                    self._generation != generation
+                    or not self._starting
+                    or self._start_task is not current_task
+                ):
+                    raise asyncio.CancelledError
+                self._session_id = uuid.uuid4().hex
+                self._gpt_system_prompt = gpt_prompt
+                self._minicpm_input_prompt = input_prompt
+                self._model_provider = frozen_provider
+                self._model_name = frozen_model
+                self._history.clear()
+                self._turn_generation += 1
+                self._owns_server = started_here
+                self._starting = False
+                self._start_task = None
+                return self.snapshot()
+        except BaseException:
+            async with self._lock:
+                if self._start_task is current_task:
+                    self._starting = False
+                    self._start_task = None
+            if started_here:
+                with contextlib.suppress(Exception):
+                    await self.server_manager.stop()
+            raise
+
+    def _owns_turn_locked(
+        self,
+        generation: int,
+        session_id: str,
+        turn_generation: int,
+        task: asyncio.Task | None,
+    ) -> bool:
+        return (
+            self._generation == generation
+            and self._session_id == session_id
+            and self._turn_generation == turn_generation
+            and self._active_turn_task is task
+        )
+
+    async def _require_turn_owner(
+        self,
+        generation: int,
+        session_id: str,
+        turn_generation: int,
+        task: asyncio.Task | None,
+    ) -> None:
+        async with self._lock:
+            if not self._owns_turn_locked(
+                generation, session_id, turn_generation, task
+            ):
+                raise SmartSessionConflict("Smart turn was interrupted")
+
+    async def _publish_user_text_if_owned(
+        self,
+        *,
+        generation: int,
+        session_id: str,
+        turn_generation: int,
+        turn_id: str,
+        text: str,
+        task: asyncio.Task | None,
+    ) -> None:
+        async with self._lock:
+            if not self._owns_turn_locked(
+                generation, session_id, turn_generation, task
+            ):
+                raise SmartSessionConflict("Smart turn was interrupted")
+            try:
+                await self.events.publish(
+                    {
+                        "type": "smart.user_text",
+                        "session_id": session_id,
+                        "generation": generation,
+                        "turn_id": turn_id,
+                        "text": text,
+                    }
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+    async def _publish_user_text_delta_if_owned(
+        self,
+        *,
+        generation: int,
+        session_id: str,
+        turn_generation: int,
+        turn_id: str,
+        text: str,
+        task: asyncio.Task | None,
+    ) -> None:
+        async with self._lock:
+            if not self._owns_turn_locked(
+                generation, session_id, turn_generation, task
+            ):
+                return
+            try:
+                await self.events.publish(
+                    {
+                        "type": "smart.user_text.delta",
+                        "session_id": session_id,
+                        "generation": generation,
+                        "turn_id": turn_id,
+                        "text": text,
+                    }
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+    async def _run_minicpm_input(
+        self,
+        raw: bytes,
+        prompt: str,
+        *,
+        delta_callback: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
+        ws = None
+        upstream_session_id: str | None = None
+        accumulated_text = ""
+        accumulated_bytes = 0
+        prefix_published = False
+        rejected_delta = False
+        rejected_scan_tail = ""
+        unknown_token_tail = ""
+        max_rejected_fragment_chars = max(map(len, MINICPM_INPUT_REJECTED_FRAGMENTS))
+        try:
+            ws = await self.connector(
+                build_upstream_ws_url(DEFAULT_UPSTREAM_PORT),
+                open_timeout=10,
+                close_timeout=2,
+                max_size=MAX_GENERATED_AUDIO_BYTES * 2,
+                max_queue=8,
+                ping_interval=None,
+                ping_timeout=None,
+            )
+            await ws.send(serialize_upstream_message(build_session_init("")))
+            raw_created = await asyncio.wait_for(
+                ws.recv(), timeout=SESSION_START_TIMEOUT_SECONDS
+            )
+            created = json.loads(raw_created)
+            if created.get("type") != "session.created" or not created.get("session_id"):
+                raise SmartStageError("input stage failed")
+            upstream_session_id = str(created["session_id"])
+            await ws.send(serialize_upstream_message(build_smart_input_payload(raw, prompt)))
+            while True:
+                raw_event = await asyncio.wait_for(
+                    ws.recv(), timeout=SMART_INPUT_TIMEOUT_SECONDS
+                )
+                event = json.loads(raw_event)
+                if (
+                    event.get("type") == "response.output.delta"
+                    and event.get("kind") == "text"
+                ):
+                    value = event.get("text")
+                    chunk = value if isinstance(value, str) else ""
+                    rejected_scan = rejected_scan_tail + chunk
+                    if any(
+                        fragment in rejected_scan
+                        for fragment in MINICPM_INPUT_REJECTED_FRAGMENTS
+                    ):
+                        rejected_delta = True
+                    rejected_scan_tail = rejected_scan[-(max_rejected_fragment_chars - 1) :]
+
+                    sanitized_chunk, unknown_token_tail = sanitize_minicpm_stream_chunk(
+                        unknown_token_tail, chunk
+                    )
+
+                    remaining = max(0, MAX_SMART_TEXT_BYTES - accumulated_bytes)
+                    bounded = _utf8_prefix(
+                        sanitized_chunk, min(remaining, TRANSCRIPT_DELTA_MAX_BYTES)
+                    )
+                    if bounded:
+                        accumulated_text += bounded
+                        accumulated_bytes += len(bounded.encode("utf-8"))
+                    if rejected_delta or delta_callback is None or not bounded:
+                        continue
+                    if prefix_published:
+                        await delta_callback(bounded)
+                        continue
+
+                    cleaned_leading, holds_metadata_prefix = (
+                        sanitize_minicpm_stream_leading_text(accumulated_text)
+                    )
+                    rejected_candidate = cleaned_leading.lstrip()
+                    could_be_rejected_wrapper = not rejected_candidate or any(
+                        fragment.startswith(rejected_candidate)
+                        for fragment in MINICPM_INPUT_REJECTED_FRAGMENTS
+                    )
+                    if (
+                        len(accumulated_text) >= SMART_TEXT_DELTA_PREFIX_CHARS
+                        and not could_be_rejected_wrapper
+                        and not holds_metadata_prefix
+                        and cleaned_leading
+                    ):
+                        await delta_callback(cleaned_leading)
+                        prefix_published = True
+                    continue
+                if (
+                    event.get("type") == "response.output.delta"
+                    and event.get("kind") == "audio"
+                ):
+                    raise SmartStageError("input stage failed")
+                if event.get("type") == "response.done":
+                    if rejected_delta:
+                        raise SmartStageError("input stage failed")
+                    result = validate_minicpm_interpretation(event.get("text"))
+                    if delta_callback is not None and accumulated_text and not prefix_published:
+                        cleaned_leading, holds_metadata_prefix = (
+                            sanitize_minicpm_stream_leading_text(accumulated_text)
+                        )
+                        rejected_candidate = cleaned_leading.lstrip()
+                        could_be_rejected_wrapper = not rejected_candidate or any(
+                            fragment.startswith(rejected_candidate)
+                            for fragment in MINICPM_INPUT_REJECTED_FRAGMENTS
+                        )
+                        if (
+                            not could_be_rejected_wrapper
+                            and not holds_metadata_prefix
+                            and cleaned_leading
+                        ):
+                            await delta_callback(cleaned_leading)
+                    return result
+                if event.get("type") == "session.closed":
+                    raise SmartStageError("input stage failed")
+        except asyncio.CancelledError:
+            raise
+        except SmartStageError:
+            raise
+        except Exception as exc:
+            raise SmartStageError("input stage failed") from exc
+        finally:
+            try:
+                if ws is not None:
+                    with contextlib.suppress(Exception):
+                        await ws.close()
+            finally:
+                if upstream_session_id is not None:
+                    with contextlib.suppress(Exception):
+                        await self.close_session_request(
+                            upstream_session_id, DEFAULT_UPSTREAM_PORT
+                        )
+
+    def _trim_history_locked(self) -> None:
+        def byte_size() -> int:
+            return sum(
+                len(user.encode("utf-8")) + len(assistant.encode("utf-8"))
+                for user, assistant in self._history
+            )
+
+        while (
+            len(self._history) > MAX_SMART_HISTORY_PAIRS
+            or byte_size() > MAX_SMART_HISTORY_BYTES
+        ):
+            self._history.pop(0)
+
+    async def turn(self, raw: bytes) -> dict[str, Any]:
+        validate_smart_audio_bytes(raw)
+        current_task = asyncio.current_task()
+        async with self._lock:
+            if self._session_id is None:
+                raise SmartSessionConflict("no active Smart session")
+            if self._active_turn_task is not None and not self._active_turn_task.done():
+                raise SmartSessionConflict("a Smart turn is already active")
+            self._active_turn_task = current_task
+            self._turn_generation += 1
+            turn_generation = self._turn_generation
+            generation = self._generation
+            session_id = self._session_id
+            input_prompt = self._minicpm_input_prompt
+            gpt_prompt = self._gpt_system_prompt
+            model_provider = self._model_provider
+            model_name = self._model_name
+            history = list(self._history)
+            turn_id = uuid.uuid4().hex
+        assert session_id is not None
+        try:
+            try:
+                async def publish_delta(text: str) -> None:
+                    await self._publish_user_text_delta_if_owned(
+                        generation=generation,
+                        session_id=session_id,
+                        turn_generation=turn_generation,
+                        turn_id=turn_id,
+                        text=text,
+                        task=current_task,
+                    )
+
+                user_text = await self._run_minicpm_input(
+                    raw, input_prompt, delta_callback=publish_delta
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if isinstance(exc, SmartStageError):
+                    raise
+                raise SmartStageError("input stage failed") from exc
+            await self._require_turn_owner(
+                generation, session_id, turn_generation, current_task
+            )
+            await self._publish_user_text_if_owned(
+                generation=generation,
+                session_id=session_id,
+                turn_generation=turn_generation,
+                turn_id=turn_id,
+                text=user_text,
+                task=current_task,
+            )
+
+            messages = build_smart_gpt_messages(gpt_prompt, history, user_text)
+            try:
+                if self.llm_caller is None:
+                    completion = _default_smart_llm_caller(
+                        messages=messages,
+                        provider=model_provider,
+                        model=model_name,
+                    )
+                else:
+                    completion = self.llm_caller(
+                        messages=messages, route_info=dict(SMART_ROUTE_INFO)
+                    )
+                llm_result = await asyncio.wait_for(
+                    completion,
+                    timeout=SMART_GPT_TIMEOUT_SECONDS,
+                )
+                assistant_text = _smart_assistant_text(llm_result)
+            except asyncio.CancelledError:
+                raise
+            except SmartStageError:
+                raise
+            except Exception as exc:
+                raise SmartStageError("reasoning stage failed") from exc
+            await self._require_turn_owner(
+                generation, session_id, turn_generation, current_task
+            )
+
+            audio_base64: str | None = None
+            sample_rate: int | None = None
+            warning: str | None = None
+            tts_caller = self.tts_caller or _default_smart_tts_caller
+            try:
+                tts_payload = await asyncio.wait_for(
+                    tts_caller(assistant_text), timeout=SMART_TTS_TIMEOUT_SECONDS
+                )
+                audio_base64, _raw_audio = validate_smart_tts_response(
+                    tts_payload, assistant_text
+                )
+                sample_rate = SMART_TTS_SAMPLE_RATE
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                warning = "MiniCPM native speech failed."
+            await self._require_turn_owner(
+                generation, session_id, turn_generation, current_task
+            )
+
+            async with self._lock:
+                if not self._owns_turn_locked(
+                    generation, session_id, turn_generation, current_task
+                ):
+                    raise SmartSessionConflict("Smart turn was interrupted")
+                self._history.append((user_text, assistant_text))
+                self._trim_history_locked()
+            return {
+                "state": "listening",
+                "session_id": session_id,
+                "generation": generation,
+                "turn_id": turn_id,
+                "user_text": user_text,
+                "assistant_text": assistant_text,
+                "audio_base64": audio_base64,
+                "sample_rate": sample_rate,
+                "warning": warning,
+            }
+        except asyncio.CancelledError as exc:
+            raise SmartSessionConflict("Smart turn was interrupted") from exc
+        finally:
+            async with self._lock:
+                if self._active_turn_task is current_task:
+                    self._active_turn_task = None
+
+    async def interrupt(self) -> dict[str, Any]:
+        async with self._lock:
+            task = self._active_turn_task
+            self._active_turn_task = None
+            self._turn_generation += 1
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return self.snapshot()
+
+    async def clear_history(self) -> dict[str, Any]:
+        async with self._lock:
+            if (
+                self._active_turn_task is not None
+                and not self._active_turn_task.done()
+            ):
+                raise SmartSessionConflict("a Smart turn is active")
+            self._history.clear()
+            return self.snapshot()
+
+    async def stop(self) -> dict[str, Any]:
+        async with self._lock:
+            task = self._active_turn_task
+            self._active_turn_task = None
+            start_task = self._start_task
+            self._start_task = None
+            self._starting = False
+            self._turn_generation += 1
+            owned_server = self._owns_server
+            self._owns_server = False
+            self._generation += 1
+            self._session_id = None
+            self._gpt_system_prompt = ""
+            self._minicpm_input_prompt = ""
+            self._model_provider = ""
+            self._model_name = ""
+            self._history.clear()
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if (
+            start_task is not None
+            and start_task is not asyncio.current_task()
+            and not start_task.done()
+        ):
+            start_task.cancel()
+            await asyncio.gather(start_task, return_exceptions=True)
+        if owned_server:
+            await self.server_manager.stop()
+        return self.snapshot()
+
+
 def _ws_upgrade_authorized(ws: WebSocket) -> bool:
     try:
         from hermes_cli import web_server as dashboard_server
@@ -1590,6 +2564,10 @@ def _ws_upgrade_authorized(ws: WebSocket) -> bool:
 
 bridge = VoiceBridge()
 server_manager = LocalOmniServerManager()
+smart_session = SmartMiniCPMSession(
+    server_manager=server_manager,
+    events=bridge.events,
+)
 
 
 class SessionStartBody(BaseModel):
@@ -1602,6 +2580,29 @@ class SessionStartBody(BaseModel):
     @classmethod
     def enforce_system_prompt_byte_limit(cls, value: str) -> str:
         return validate_system_prompt(value)
+
+
+class SmartSessionStartBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    gpt_system_prompt: str
+    minicpm_input_prompt: str
+    model_provider: str = ""
+    model_name: str = ""
+
+    @field_validator("gpt_system_prompt")
+    @classmethod
+    def enforce_gpt_prompt_byte_limit(cls, value: str) -> str:
+        return validate_system_prompt(value)
+
+    @field_validator("minicpm_input_prompt")
+    @classmethod
+    def enforce_minicpm_prompt_requirements(cls, value: str) -> str:
+        return validate_minicpm_input_prompt(value)
+
+
+class EmptyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 async def probe_upstream_health(port: int = DEFAULT_UPSTREAM_PORT) -> dict[str, Any]:
@@ -1652,6 +2653,24 @@ async def server_status() -> dict[str, Any]:
     return await server_manager.status()
 
 
+@router.get("/smart/models")
+async def smart_models(request: Request, refresh: bool = False) -> dict[str, Any]:
+    query_items = request.query_params.multi_items()
+    if any(key != "refresh" for key, _value in query_items) or sum(
+        key == "refresh" for key, _value in query_items
+    ) > 1:
+        raise HTTPException(status_code=422, detail="Invalid model catalog request.")
+    try:
+        payload = await asyncio.to_thread(smart_models_inventory_loader, refresh)
+        return sanitize_smart_models_catalog(payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail="Model catalog is unavailable."
+        ) from exc
+
+
 @router.post("/server/start")
 async def start_server() -> dict[str, Any]:
     try:
@@ -1688,6 +2707,128 @@ async def start_session(body: SessionStartBody) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except BridgeUpstreamError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/smart/session/start")
+async def start_smart_session(body: SmartSessionStartBody) -> dict[str, Any]:
+    try:
+        model_provider, model_name = await validate_smart_model_selection(
+            body.model_provider, body.model_name
+        )
+        return await smart_session.start(
+            body.gpt_system_prompt,
+            body.minicpm_input_prompt,
+            model_provider,
+            model_name,
+        )
+    except SmartModelSelectionUnavailable as exc:
+        raise HTTPException(
+            status_code=400, detail="Model selection is unavailable."
+        ) from exc
+    except SmartSessionConflict as exc:
+        raise HTTPException(
+            status_code=409, detail="A Smart session is already active."
+        ) from exc
+    except ServerConfigurationError as exc:
+        raise HTTPException(
+            status_code=400, detail="Local server configuration is invalid."
+        ) from exc
+    except ServerConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail="The local voice server is unavailable."
+        ) from exc
+    except ServerStartupTimeout as exc:
+        raise HTTPException(
+            status_code=504, detail="Managed server startup timed out."
+        ) from exc
+    except (ServerStartError, SmartSessionError) as exc:
+        raise HTTPException(
+            status_code=502, detail="Smart session could not be started."
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail="Smart session could not be started."
+        ) from exc
+
+
+@router.post("/smart/turn")
+async def submit_smart_turn(request: Request) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "")
+    if not content_type.lower().startswith("multipart/form-data;"):
+        raise HTTPException(
+            status_code=http_status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="multipart form upload is required",
+        )
+    try:
+        form = await request.form()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid multipart upload") from exc
+    entries = list(form.multi_items())
+    if len(entries) != 1 or entries[0][0] != "file":
+        for _name, value in entries:
+            if isinstance(value, StarletteUploadFile):
+                await value.close()
+        raise HTTPException(status_code=422, detail="form must contain exactly file")
+    audio = entries[0][1]
+    if not isinstance(audio, StarletteUploadFile):
+        raise HTTPException(status_code=422, detail="file must be an upload")
+    if not isinstance(audio.content_type, str) or audio.content_type.lower() != NATIVE_AUDIO_CONTENT_TYPE:
+        await audio.close()
+        raise HTTPException(
+            status_code=http_status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="file must use application/octet-stream",
+        )
+    try:
+        raw = await audio.read(MAX_AUDIO_BYTES + 1)
+    finally:
+        await audio.close()
+    if len(raw) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="audio upload exceeds the 5 MiB limit")
+    try:
+        validate_smart_audio_bytes(raw)
+        return await smart_session.turn(raw)
+    except AudioValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SmartSessionConflict as exc:
+        raise HTTPException(status_code=409, detail="Smart turn is not active.") from exc
+    except SmartStageError as exc:
+        detail = {
+            "input stage failed": "Smart input failed.",
+            "reasoning stage failed": "Smart reasoning failed.",
+        }.get(str(exc), "Smart turn failed.")
+        raise HTTPException(status_code=502, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Smart turn failed.") from exc
+
+
+@router.post("/smart/session/interrupt")
+async def interrupt_smart_session(_body: EmptyBody) -> dict[str, Any]:
+    try:
+        return await smart_session.interrupt()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Smart turn could not be interrupted.") from exc
+
+
+@router.post("/smart/session/clear-history")
+async def clear_smart_history(_body: EmptyBody) -> dict[str, Any]:
+    try:
+        return await smart_session.clear_history()
+    except SmartSessionConflict as exc:
+        raise HTTPException(
+            status_code=409, detail="A Smart turn is active."
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail="Smart history could not be cleared."
+        ) from exc
+
+
+@router.post("/smart/session/stop")
+async def stop_smart_session(_body: EmptyBody) -> dict[str, Any]:
+    try:
+        return await smart_session.stop()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Smart session could not be stopped.") from exc
 
 
 @router.post("/turn")
